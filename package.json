@@ -1,0 +1,37 @@
+{
+  "name": "ai-software-engineering-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic state-machine orchestration for AI-assisted software engineering tasks.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "intake:validate": "tsx src/intake/validate.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/db/migrate.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.36.4",
+    "luxon": "^3.5.0",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "yaml": "^2.6.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/luxon": "^3.4.2",
+    "@types/node": "^22.9.0",
+    "@types/pg": "^8.11.10",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "drizzle-kit": "^0.27.1",
+    "eslint": "^9.16.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

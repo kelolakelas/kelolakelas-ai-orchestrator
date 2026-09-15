@@ -1,0 +1,2 @@
+CREATE TYPE "public"."task_complexity" AS ENUM('very-low', 'low', 'medium', 'high', 'very-high', 'critical');--> statement-breakpoint
+ALTER TABLE "tasks" ALTER COLUMN "complexity" TYPE "task_complexity" USING "complexity"::"task_complexity";

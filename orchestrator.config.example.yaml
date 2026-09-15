@@ -1,0 +1,36 @@
+timezone: Asia/Jakarta
+orchestrator:
+  maxConcurrentTasks: 1
+  pollingIntervalSeconds: 60
+schedule:
+  enabled: true
+  allowMechanicalOperationsOutsideHours: true
+  finishCurrentStep: true
+  startNewStepIfRemainingMinutesAtLeast: 20
+  minimumRemainingMinutesForNewTask: 45
+  minimumRemainingMinutesForAnalysis: 20
+  minimumRemainingMinutesForImplementation: 45
+  minimumRemainingMinutesForReview: 20
+  days:
+    monday: { enabled: true, windows: [{ start: "08:00", end: "12:00" }, { start: "13:00", end: "18:00" }] }
+    tuesday: { enabled: true, windows: [{ start: "08:00", end: "18:00" }] }
+    wednesday: { enabled: true, windows: [{ start: "08:00", end: "18:00" }] }
+    thursday: { enabled: true, windows: [{ start: "08:00", end: "18:00" }] }
+    friday: { enabled: true, windows: [{ start: "08:00", end: "17:00" }] }
+    saturday: { enabled: false, windows: [] }
+    sunday: { enabled: false, windows: [] }
+linear:
+  teamKey: KEL
+  requiredLabels: [ai-ready]
+  excludedLabels: [human-only, blocked]
+models:
+  analyzer: { tier: terra, effort: high }
+  reviewer: { tier: terra, effort: high }
+  tiers:
+    luna: { model: configurable-luna-model }
+    terra: { model: configurable-terra-model }
+    sol: { model: configurable-sol-model }
+limits:
+  maxImplementationAttempts: 4
+  maxQualityFixAttempts: 3
+  maxReviewCycles: 3

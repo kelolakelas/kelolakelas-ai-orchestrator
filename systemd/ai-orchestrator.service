@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Software Engineering Orchestrator
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-orchestrator
+WorkingDirectory=/opt/ai-orchestrator
+EnvironmentFile=/etc/ai-orchestrator/orchestrator.env
+ExecStart=/usr/bin/node /opt/ai-orchestrator/dist/src/index.js
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

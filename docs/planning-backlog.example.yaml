@@ -1,0 +1,75 @@
+schemaVersion: kelolakelas.planning-backlog/v1
+projects:
+  - key: class-commerce-foundation
+    name: Class commerce foundation
+    outcome: Tenants can publish sellable classes and buyers can discover them.
+    problem: Publication readiness and buyer visibility are not yet connected as a verified flow.
+    valueAndPriority: High user impact, high confidence, and medium total effort.
+    scope:
+      - Validate class publication readiness.
+      - Expose published classes to buyers.
+    outOfScope:
+      - Payment settlement.
+    successMetrics:
+      - Complete classes can be published and discovered.
+    dependenciesAndRisks: []
+issues:
+  - draftKey: validate-class-publication
+    projectKey: class-commerce-foundation
+    title: Validate class publication readiness
+    type: Improvement
+    priority: High
+    estimate: S
+    complexity: medium
+    labels: [academic, ai-ready]
+    repositories: [academic]
+    blockedByDraftKeys: []
+    externalDependencies: []
+    body:
+      backgroundProblem: Tenants need publication rules that prevent incomplete class offers from reaching buyers.
+      goal: A tenant can publish a class only when its required selling information is complete.
+      requirements:
+        - Validate publication readiness using current class data.
+        - Preserve existing draft editing behavior.
+      acceptanceCriteria:
+        - A complete class can be published.
+        - An incomplete class is rejected with actionable validation errors.
+      technicalNotes: Preserve tenant ownership and existing class authorization boundaries.
+      relevantAreas:
+        - kelolakelas-academic-service/internal/usecase
+      edgeCases:
+        - A class has no active schedule.
+      testingValidation:
+        - Relevant unit and integration tests pass.
+      outOfScope:
+        - Buyer checkout and payment.
+  - draftKey: show-published-class
+    projectKey: class-commerce-foundation
+    title: Show published classes to buyers
+    type: Feature
+    priority: High
+    estimate: M
+    complexity: high
+    labels: [web, academic, ai-ready]
+    repositories: [web, academic]
+    blockedByDraftKeys: [validate-class-publication]
+    externalDependencies: []
+    body:
+      backgroundProblem: Buyers need a reliable view of class offers that tenants have made ready for sale.
+      goal: Buyers can discover and inspect classes that satisfy publication rules.
+      requirements:
+        - Return only published classes from the public catalog.
+        - Render the current class detail needed for a purchase decision.
+      acceptanceCriteria:
+        - A published class appears in the public catalog.
+        - A draft or incomplete class is not publicly visible.
+      technicalNotes: Reuse the existing public catalog contract where current code supports it.
+      relevantAreas:
+        - kelolakelas-academic-service/internal/delivery
+        - kelolakelas-web/app
+      edgeCases:
+        - A previously published class becomes unavailable.
+      testingValidation:
+        - Relevant service and web tests pass.
+      outOfScope:
+        - Search ranking and recommendations.
