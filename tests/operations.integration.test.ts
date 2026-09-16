@@ -227,6 +227,37 @@ describeIntegration('production operations with PostgreSQL', () => {
     });
   });
 
+  it('bounds lane refills per tick so constantly claimable delivery work cannot starve execution or intake', async () => {
+    for (let index = 0; index < 6; index += 1) {
+      const id = await createQueued(['web']);
+      await pool.query(`UPDATE tasks SET state = 'WAITING_CI' WHERE id = $1`, [id]);
+    }
+    const queued = await createQueued(['billing']);
+    const listIssues = vi.fn(async () => []);
+    const instance = worker('worker-refill', {
+      ANALYZING: { run: async () => ({ kind: 'advance', to: 'READY' }) },
+      // Each observation finishes at once and is claimable again immediately: an unbounded refill never ends.
+      WAITING_CI: { run: async () => ({ kind: 'wait', until: new Date(0), reason: 'checks pending' }) },
+    }, {
+      config: testConfig({ orchestrator: { maxConcurrentDeliveryTasks: 2 }, schedule: { enabled: false } }),
+      linear: { listIssues },
+      // A claim slower than a stage, as on a busy database, lets claimed observations finish before the next claim.
+      tasks: new Proxy(tasks, {
+        get: (target, property, receiver) => property === 'claimNextTask'
+          ? async (...args: Parameters<TaskRepository['claimNextTask']>) => { await new Promise((resolve) => setTimeout(resolve, 40)); return target.claimNextTask(...args); }
+          : Reflect.get(target, property, receiver),
+      }),
+      timing: { pollIntervalMs: 300 },
+    });
+
+    const startedAt = Date.now();
+    await instance.runOnce();
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    await instance.drain();
+    expect(await tasks.getTask(queued)).toMatchObject({ state: 'READY' });
+    expect(listIssues).toHaveBeenCalledTimes(1);
+  });
+
   it('holds execution claims while the runner is usage limited and resumes after the hold', async () => {
     const limited = await createQueued(['web']);
     const other = await createQueued(['web']);
