@@ -43,6 +43,13 @@
       "when": 1789565759841,
       "tag": "0005_phase4_workspace_identity",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789568724070,
+      "tag": "0006_phase5_agent_attempts",
+      "breakpoints": true
     }
   ]
 }

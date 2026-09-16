@@ -89,7 +89,14 @@ export const taskAttempts = pgTable('task_attempts', {
   stage: taskStateEnum('stage').notNull(),
   attempt: integer('attempt').notNull(),
   failureCategory: text('failure_category'),
+  /** Normalized stage input: prompt digest, template version, model selection, and workspace commits. Never a prompt or secret. */
+  input: jsonb('input').$type<Record<string, unknown>>(),
+  /** Normalized, schema-validated model result or deterministic stage result. */
   result: jsonb('result').$type<Record<string, unknown>>(),
+  /** Redacted validation evidence such as quality command outcomes and diff-policy findings. */
+  evidence: jsonb('evidence').$type<Record<string, unknown>>(),
+  /** Runner token usage for the attempt. */
+  usage: jsonb('usage').$type<Record<string, unknown>>(),
   startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp('completed_at', { withTimezone: true }),
 }, (table) => [

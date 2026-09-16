@@ -18,7 +18,7 @@ async function resetDatabase(client: Client): Promise<void> {
 
 // Schema resets and DDL fsync heavily; allow for slow disks rather than the 5 second default.
 describeMigration('database migrations', { timeout: 60_000 }, () => {
-  it('preserves a Phase 1 task through every migration including Phase 3 controls', async () => {
+  it('preserves Phase 1 tasks and Phase 4 attempts through every migration', async () => {
     const client = new Client({ connectionString: migrationDatabaseUrl });
     await client.connect();
 
@@ -40,6 +40,11 @@ describeMigration('database migrations', { timeout: 60_000 }, () => {
       await applyMigration(client, '0003_true_grey_gargoyle.sql');
       await applyMigration(client, '0004_phase3_scheduler_controls.sql');
       await applyMigration(client, '0005_phase4_workspace_identity.sql');
+      const phase4 = await client.query<{ id: string }>('SELECT id FROM tasks WHERE linear_issue_id = $1', ['issue-1']);
+      await client.query("INSERT INTO task_attempts (task_id, stage, attempt, result) VALUES ($1, 'ANALYZING', 1, '{\"legacy\": true}')", [phase4.rows[0]?.id]);
+      await applyMigration(client, '0006_phase5_agent_attempts.sql');
+      const attempt = await client.query<{ result: unknown; input: unknown; evidence: unknown; usage: unknown }>('SELECT result, input, evidence, usage FROM task_attempts');
+      expect(attempt.rows).toEqual([{ result: { legacy: true }, input: null, evidence: null, usage: null }]);
       const upgraded = await client.query<{ complexity: string; resume_after: Date | null; cancel_requested_at: Date | null }>(
         'SELECT complexity, resume_after, cancel_requested_at FROM tasks WHERE linear_issue_id = $1',
         ['issue-1'],

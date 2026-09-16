@@ -1,8 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { access, constants } from 'node:fs/promises';
 import { hostname } from 'node:os';
+import { join } from 'node:path';
 import { loadConfig } from './config/config.js';
 import { createDatabase } from './db/client.js';
+import { CodexCliRunner } from './execution/agent-runner.js';
+import { DocumentationLoader } from './execution/documentation.js';
+import { QualityGateRunner } from './execution/quality-gates.js';
+import { collectKnownSecrets } from './execution/secrets.js';
+import { createExecutionHandlers } from './execution/stages/index.js';
+import type { ExecutionDependencies } from './execution/stages/stage-support.js';
+import { WorkspaceChanges } from './execution/workspace-changes.js';
 import { createHttpServer } from './http/server.js';
 import { createLogger } from './observability/logger.js';
 import { Scheduler, type MaintenanceTask } from './orchestrator/scheduler.js';
@@ -34,23 +43,69 @@ async function main(): Promise<void> {
   const tasks = new TaskRepository(db);
   const operator = new OperatorRepository(db);
 
-  // Stage handlers are opt-in. Phase 4 prepares worktrees; analysis and implementation arrive in Phase 5. Workspace
-  // releases run whenever a registry is configured so terminal tasks never leave worktrees behind.
+  // Stage handlers are opt-in. Phase 4 prepares worktrees; Phase 5 adds analysis, implementation, quality gates, fixes,
+  // and review, and parks reviewed local branches because delivery does not exist yet. Workspace releases run whenever a
+  // registry is configured so terminal tasks never leave worktrees behind.
   const handlers: StageHandlers = {};
   const maintenance: MaintenanceTask[] = [];
   if (config.workspace !== undefined) {
     const registry = await RepositoryRegistry.load(config);
+    const git = new GitRunner(config.workspace.gitTimeoutSeconds * 1_000);
     const workspaces = new WorkspaceManager(
       registry,
-      new GitRunner(config.workspace.gitTimeoutSeconds * 1_000),
+      git,
       new PostgresRepositoryLock(pool, config.workspace.repositoryLockTimeoutSeconds * 1_000),
       { minimumFreeDiskMb: config.workspace.minimumFreeDiskMb },
     );
     maintenance.push(new WorkspaceJanitor(workspaces, tasks, log));
-    if (config.orchestrator.execution.prepareWorkspaces) {
-      handlers.ANALYZING = new WorkspacePreparationStage(workspaces, tasks, { workerId, remoteRetryMs: config.workspace.remoteRetryMinutes * 60_000 });
+    const preparation = { workerId, remoteRetryMs: config.workspace.remoteRetryMinutes * 60_000 };
+    if (config.orchestrator.execution.runAgents && config.agents !== undefined) {
+      const agents = config.agents;
+      await access(agents.runner.executable, constants.X_OK).catch(() => {
+        throw new Error(`Agent runner executable is not executable: ${agents.runner.executable}`);
+      });
+      const knownSecrets = collectKnownSecrets(process.env);
+      const execution: ExecutionDependencies = {
+        config,
+        agents,
+        tasks,
+        registry,
+        workspaces,
+        changes: new WorkspaceChanges(git),
+        runner: new CodexCliRunner({
+          executable: agents.runner.executable,
+          // Inside the workspace root but outside every task directory, so no agent can write run files.
+          scratchRoot: join(registry.workspaceRoot, '.runner'),
+          sourceEnvironment: process.env,
+          extraEnvironment: agents.runner.environment,
+          maxResultBytes: agents.runner.maxResultBytes,
+          maxEventBytes: agents.runner.maxEventBytes,
+          knownSecrets,
+        }),
+        quality: new QualityGateRunner({
+          quality: (repository) => {
+            const entry = config.repositories[registry.get(repository).name];
+            if (entry === undefined) throw new Error(`Repository ${repository} has no configuration`);
+            return entry.quality;
+          },
+          sourceEnvironment: process.env,
+          knownSecrets,
+        }),
+        documentation: new DocumentationLoader(agents.documentation, config.repositories),
+        workerId,
+        knownSecrets,
+        clock: () => new Date(),
+      };
+      Object.assign(handlers, createExecutionHandlers(execution, preparation));
+    } else if (config.orchestrator.execution.prepareWorkspaces) {
+      handlers.ANALYZING = new WorkspacePreparationStage(workspaces, tasks, preparation);
     }
-    log('workspace_registry_loaded', { root: registry.workspaceRoot, repositories: registry.names(), prepareWorkspaces: config.orchestrator.execution.prepareWorkspaces });
+    log('workspace_registry_loaded', {
+      root: registry.workspaceRoot,
+      repositories: registry.names(),
+      prepareWorkspaces: config.orchestrator.execution.prepareWorkspaces,
+      runAgents: config.orchestrator.execution.runAgents,
+    });
   }
   const scheduler = new Scheduler({
     config,

@@ -1,16 +1,17 @@
-import { and, asc, count, eq, exists, inArray, isNotNull, isNull, lt, lte, ne, notExists, notInArray, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, count, desc, eq, exists, inArray, isNotNull, isNull, lt, lte, ne, notExists, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { alias } from 'drizzle-orm/pg-core';
+import { alias, type PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import type * as schema from '../db/schema.js';
 import { externalOperations, intakeQuarantines, stateTransitions, taskAttempts, taskCheckpoints, taskDependencies, taskWorkUnits, tasks } from '../db/schema.js';
 import { canTransition, transitionTask as validateTransition } from '../orchestrator/state-machine.js';
 import type { ComplexityValue } from '../types/complexity.js';
-import type { PauseReason, TaskState } from '../types/domain.js';
+import type { AttemptCounter, PauseReason, TaskState } from '../types/domain.js';
 
 export type Database = NodePgDatabase<typeof schema>;
 export type DatabaseTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 export type PersistedTask = typeof tasks.$inferSelect;
 export type PersistedWorkUnit = typeof taskWorkUnits.$inferSelect;
+export type PersistedAttempt = typeof taskAttempts.$inferSelect;
 
 /** A persisted workspace identity collides with another work unit's branch or path. */
 export class WorkspaceIdentityConflictError extends Error {
@@ -23,7 +24,7 @@ export class WorkspaceIdentityConflictError extends Error {
 /** Serializes claims across every orchestrator process sharing the database. */
 const claimLockName = 'kelolakelas.ai-orchestrator.task-claim';
 
-function stableJson(value: unknown): string {
+export function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value !== null && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right));
@@ -70,6 +71,8 @@ export interface TaskTransitionInput {
   releaseLease?: boolean;
   lastError?: string | null;
   requiresManualIntervention?: boolean;
+  /** Consumes one bounded attempt in the same transaction as the state change. */
+  incrementCounter?: AttemptCounter;
 }
 
 export interface TaskClaimInput {
@@ -109,6 +112,9 @@ export interface LockedTransitionInput {
   requiresManualIntervention?: boolean;
   lastError?: string | null;
   clearCancelRequest?: boolean;
+  incrementCounter?: AttemptCounter;
+  /** Grants a new bounded cycle, for example when an operator retries a `FAILED` task. */
+  resetAttemptCounters?: boolean;
   lease?: { owner: string | null; expiresAt: Date | null; heartbeatAt: Date | null };
 }
 
@@ -138,7 +144,7 @@ export async function transitionLockedTask(
   });
   const now = new Date();
   const paused = transition.to === 'PAUSED_SCHEDULE' || transition.to === 'PAUSED_LIMIT';
-  const updates: Partial<typeof tasks.$inferInsert> = {
+  const updates: PgUpdateSetSource<typeof tasks> = {
     state: transition.to,
     resumeState: transition.resumeState ?? null,
     pauseReason: transition.pauseReason ?? null,
@@ -149,6 +155,12 @@ export async function transitionLockedTask(
   };
   if (input.lastError !== undefined) updates.lastError = input.lastError;
   if (input.clearCancelRequest) updates.cancelRequestedAt = null;
+  if (input.resetAttemptCounters) {
+    updates.implementationAttempts = 0;
+    updates.qualityFixAttempts = 0;
+    updates.reviewAttempts = 0;
+  }
+  if (input.incrementCounter !== undefined) updates[input.incrementCounter] = sql`${tasks[input.incrementCounter]} + 1`;
   if (input.lease !== undefined) {
     updates.leaseOwner = input.lease.owner;
     updates.leaseExpiresAt = input.lease.expiresAt;
@@ -415,6 +427,7 @@ export class TaskRepository {
         ...(input.leaseOwner === undefined ? {} : { leaseOwner: input.leaseOwner }),
         ...(input.lastError === undefined ? {} : { lastError: input.lastError }),
         ...(input.requiresManualIntervention === undefined ? {} : { requiresManualIntervention: input.requiresManualIntervention }),
+        ...(input.incrementCounter === undefined ? {} : { incrementCounter: input.incrementCounter }),
         ...(input.releaseLease ? { lease: clearedLease } : {}),
       });
     });
@@ -501,6 +514,66 @@ export class TaskRepository {
         completedAt: input.completedAt ?? null,
       },
     });
+  }
+
+  /**
+   * Starts, or restarts, the current run of a stage and returns its attempt number. A run that never completed (the
+   * worker was interrupted or paused) is reused, so attempt numbers count finished runs plus at most one in progress.
+   */
+  async startAttempt(input: { taskId: string; stage: TaskState; leaseOwner: string; input: Record<string, unknown> }): Promise<number> {
+    return this.db.transaction(async (transaction) => {
+      const leased = await transaction.select({ id: tasks.id }).from(tasks)
+        .where(and(eq(tasks.id, input.taskId), eq(tasks.leaseOwner, input.leaseOwner)))
+        .for('update');
+      if (!leased[0]) throw new LeaseOwnershipError(input.taskId);
+      const latest = (await transaction.select().from(taskAttempts)
+        .where(and(eq(taskAttempts.taskId, input.taskId), eq(taskAttempts.stage, input.stage)))
+        .orderBy(desc(taskAttempts.attempt))
+        .limit(1))[0];
+      if (latest && latest.completedAt === null) {
+        await transaction.update(taskAttempts).set({ input: input.input, startedAt: new Date() }).where(eq(taskAttempts.id, latest.id));
+        return latest.attempt;
+      }
+      const attempt = (latest?.attempt ?? 0) + 1;
+      await transaction.insert(taskAttempts).values({ taskId: input.taskId, stage: input.stage, attempt, input: input.input });
+      return attempt;
+    });
+  }
+
+  async completeAttempt(input: {
+    taskId: string;
+    stage: TaskState;
+    attempt: number;
+    failureCategory: string | null;
+    result?: Record<string, unknown> | null;
+    evidence?: Record<string, unknown> | null;
+    usage?: Record<string, unknown> | null;
+    completedAt?: Date;
+  }): Promise<void> {
+    const updated = await this.db.update(taskAttempts)
+      .set({
+        failureCategory: input.failureCategory,
+        result: input.result ?? null,
+        evidence: input.evidence ?? null,
+        usage: input.usage ?? null,
+        completedAt: input.completedAt ?? new Date(),
+      })
+      .where(and(eq(taskAttempts.taskId, input.taskId), eq(taskAttempts.stage, input.stage), eq(taskAttempts.attempt, input.attempt)))
+      .returning({ id: taskAttempts.id });
+    if (!updated[0]) throw new Error(`Attempt not found: ${input.stage} ${input.attempt} for task ${input.taskId}`);
+  }
+
+  async listAttempts(taskId: string): Promise<PersistedAttempt[]> {
+    return this.db.select().from(taskAttempts).where(eq(taskAttempts.taskId, taskId)).orderBy(asc(taskAttempts.startedAt), asc(taskAttempts.attempt));
+  }
+
+  /** Records the routed model for the current implementation attempt while the caller holds the lease. */
+  async recordModelSelection(taskId: string, leaseOwner: string, selection: { tier: string; model: string; effort: string }): Promise<void> {
+    const updated = await this.db.update(tasks)
+      .set({ selectedModelTier: selection.tier, selectedModel: selection.model, reasoningEffort: selection.effort, updatedAt: new Date() })
+      .where(and(eq(tasks.id, taskId), eq(tasks.leaseOwner, leaseOwner)))
+      .returning({ id: tasks.id });
+    if (!updated[0]) throw new LeaseOwnershipError(taskId);
   }
 
   async recordExternalOperation(input: {

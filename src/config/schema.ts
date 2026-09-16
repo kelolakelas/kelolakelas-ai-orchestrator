@@ -2,6 +2,7 @@ import { isAbsolute } from 'node:path';
 import { DateTime } from 'luxon';
 import { z } from 'zod';
 import { repositoryNames } from '../intake/planning-contract.js';
+import { routedModelTiers } from '../routing/escalation-policy.js';
 
 const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
 const windowSchema = z.object({
@@ -12,11 +13,89 @@ const daySchema = z.object({ enabled: z.boolean(), windows: z.array(windowSchema
 const absolutePath = z.string().min(1).refine((value) => isAbsolute(value), 'must be an absolute path');
 const gitRefComponent = z.string().regex(/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/, 'must be a simple Git ref name');
 
+const environmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'must be an environment variable name');
+const relativeFilePath = z.string().min(1).refine((value) => !isAbsolute(value) && !value.split(/[\\/]/).includes('..'), 'must be a relative path without ..');
+
+/** Orchestrator credentials that must never reach an agent or a repository command. */
+export const withheldEnvironment = ['DATABASE_URL', 'LINEAR_API_KEY', 'ORCHESTRATOR_OPERATOR_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN'] as const;
+
+/**
+ * A trusted repository command. Commands are argument arrays from operator configuration and are addressed by name;
+ * nothing sourced from Linear, repository content, or model output can add or alter one.
+ */
+const qualityCommandSchema = z.object({
+  name: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'must be a lowercase command name'),
+  command: z.array(z.string().min(1)).min(1),
+  timeoutSeconds: z.number().int().positive().max(7_200).default(900),
+}).strict();
+
+const uniqueCommands = z.array(qualityCommandSchema).superRefine((commands, context) => {
+  const names = commands.map((command) => command.name);
+  if (new Set(names).size !== names.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'command names must be unique' });
+});
+
 const repositorySchema = z.object({
   path: absolutePath,
   github: z.string().regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, 'must be owner/name'),
   remote: z.string().regex(/^[A-Za-z0-9._-]+$/, 'must be a Git remote name').default('origin'),
   baseBranch: gitRefComponent.default('main'),
+  quality: z.object({
+    /** Runs before implementation and before every quality pass, for example a dependency install. */
+    setup: uniqueCommands.default([]),
+    /** Formatter check, lint, typecheck/build, and tests, in order. */
+    checks: uniqueCommands.default([]),
+    /** Extra environment variable names passed to setup and check commands. */
+    environment: z.array(environmentName).default([]),
+    /** Documentation files, relative to `agents.documentation.root`, given to agents working in this repository. */
+    documentation: z.array(relativeFilePath).default([]),
+  }).strict().default({}),
+}).strict();
+
+const timeoutMinutes = z.number().int().positive().max(480);
+
+const agentsSchema = z.object({
+  runner: z.object({
+    kind: z.literal('codex-cli').default('codex-cli'),
+    /** Absolute path of the runner executable; it is never resolved through PATH. */
+    executable: absolutePath,
+    /** Extra environment variable names passed to the runner process, such as `CODEX_HOME` or `OPENAI_API_KEY`. */
+    environment: z.array(environmentName).default([]),
+    timeoutMinutes: z.object({
+      analysis: timeoutMinutes.default(20),
+      implementation: timeoutMinutes.default(60),
+      fix: timeoutMinutes.default(45),
+      review: timeoutMinutes.default(20),
+    }).strict().default({}),
+    /** Largest accepted final structured result. */
+    maxResultBytes: z.number().int().positive().max(4 * 1024 * 1024).default(256 * 1024),
+    /** Largest runner event stream; the run is stopped when it is exceeded. */
+    maxEventBytes: z.number().int().positive().max(512 * 1024 * 1024).default(64 * 1024 * 1024),
+    rateLimitRetryMinutes: z.number().int().positive().default(5),
+  }).strict(),
+  commitAuthor: z.object({ name: z.string().trim().min(1), email: z.string().email() }).strict(),
+  documentation: z.object({
+    root: absolutePath,
+    /** Files given to every agent, relative to `root`. */
+    files: z.array(relativeFilePath).default([]),
+    maxBytes: z.number().int().positive().max(2 * 1024 * 1024).default(200_000),
+  }).strict().optional(),
+  diffPolicy: z.object({
+    maxChangedFiles: z.number().int().positive().default(50),
+    maxChangedLines: z.number().int().positive().default(2_000),
+    /** Changed files that the accepted analysis plan did not name. */
+    maxUnplannedFiles: z.number().int().nonnegative().default(10),
+    forbiddenPaths: z.array(z.string().min(1)).default([
+      '.git/**', '.github/**', '.gitmodules', '**/CODEOWNERS', '.husky/**', '**/.npmrc',
+      '**/AGENTS.md', '**/CLAUDE.md', '.codex/**', '.claude/**',
+      '**/.env', '**/.env.local', '**/.env.*.local', '**/.env.production', '**/*.pem', '**/*.key', '**/id_rsa*',
+    ]),
+    generatedPaths: z.array(z.string().min(1)).default([
+      '**/node_modules/**', '**/dist/**', '**/coverage/**', '**/.next/**', '**/*.min.js', '**/*.min.css',
+    ]),
+    allowedBinaryPaths: z.array(z.string().min(1)).default([]),
+  }).strict().default({}),
+  /** Largest per-repository diff included in a review prompt. */
+  maxReviewDiffBytes: z.number().int().positive().max(2 * 1024 * 1024).default(200_000),
 }).strict();
 
 export const configSchema = z.object({
@@ -35,6 +114,11 @@ export const configSchema = z.object({
     execution: z.object({
       /** Registers the Phase 4 workspace preparation stage. Requires `workspace` and `repositories`. */
       prepareWorkspaces: z.boolean().default(false),
+      /**
+       * Registers the Phase 5 analysis, implementation, quality-gate, fix, and review stages. Requires
+       * `prepareWorkspaces`, `agents`, and quality checks for every registered repository. Never pushes.
+       */
+      runAgents: z.boolean().default(false),
     }).default({}),
   }).default({}),
   workspace: z.object({
@@ -45,6 +129,7 @@ export const configSchema = z.object({
     remoteRetryMinutes: z.number().int().positive().default(5),
   }).strict().optional(),
   repositories: z.record(z.enum(repositoryNames), repositorySchema).default({}),
+  agents: agentsSchema.optional(),
   schedule: z.object({
     enabled: z.boolean().default(true),
     allowMechanicalOperationsOutsideHours: z.boolean().default(true),
@@ -108,6 +193,41 @@ export const configSchema = z.object({
     }
   }
 
+  if (config.orchestrator.execution.runAgents) {
+    if (!config.orchestrator.execution.prepareWorkspaces) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['orchestrator', 'execution', 'prepareWorkspaces'], message: 'must be true when orchestrator.execution.runAgents is true' });
+    }
+    if (config.agents === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['agents'], message: 'is required when orchestrator.execution.runAgents is true' });
+    }
+    for (const tier of routedModelTiers.filter((routed) => config.models.tiers[routed] === undefined)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['models', 'tiers'], message: `must configure routed model tier ${tier} when orchestrator.execution.runAgents is true` });
+    }
+    for (const [name, repository] of Object.entries(config.repositories)) {
+      if (repository.quality.checks.length === 0) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['repositories', name, 'quality', 'checks'], message: 'must define at least one check when orchestrator.execution.runAgents is true' });
+      }
+      if (repository.quality.documentation.length > 0 && config.agents?.documentation === undefined) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['repositories', name, 'quality', 'documentation'], message: 'requires agents.documentation.root' });
+      }
+    }
+  }
+
+  const exposures: Array<{ path: string[]; names: readonly string[]; withheld: readonly string[] }> = [
+    { path: ['agents', 'runner', 'environment'], names: config.agents?.runner.environment ?? [], withheld: withheldEnvironment },
+    // Repository commands execute model-written code, so they never receive model credentials either.
+    ...Object.entries(config.repositories).map(([name, repository]) => ({
+      path: ['repositories', name, 'quality', 'environment'],
+      names: repository.quality.environment,
+      withheld: [...withheldEnvironment, 'OPENAI_API_KEY', 'CODEX_API_KEY'],
+    })),
+  ];
+  for (const exposure of exposures) {
+    for (const variable of exposure.names.filter((name) => exposure.withheld.includes(name))) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: exposure.path, message: `must not expose orchestrator credential ${variable}` });
+    }
+  }
+
   for (const role of ['analyzer', 'reviewer'] as const) {
     const tier = config.models[role].tier;
     if (config.models.tiers[tier] === undefined) {
@@ -121,6 +241,9 @@ export const configSchema = z.object({
 });
 
 export type OrchestratorConfig = z.infer<typeof configSchema>;
+export type AgentsConfig = z.infer<typeof agentsSchema>;
+export type QualityCommand = z.infer<typeof qualityCommandSchema>;
+export type RepositoryQualityConfig = z.infer<typeof repositorySchema>['quality'];
 export type ScheduleDay = keyof OrchestratorConfig['schedule']['days'];
 
 export function validateConfig(input: unknown): OrchestratorConfig {

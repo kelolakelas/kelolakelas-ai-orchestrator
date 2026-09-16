@@ -10,6 +10,9 @@ const escalation: Record<Complexity, readonly { tier: string; effort: Effort }[]
   critical: [{ tier: 'sol', effort: 'high' }, { tier: 'sol', effort: 'max' }],
 };
 
+/** Every model tier an implementation route can select. */
+export const routedModelTiers: readonly string[] = [...new Set(Object.values(escalation).flatMap((routes) => routes.map((route) => route.tier)))];
+
 export function escalationStep(config: OrchestratorConfig, complexity: Complexity, attempt: number): ModelSelection | undefined {
   if (!Number.isInteger(attempt) || attempt < 1 || attempt > config.limits.maxImplementationAttempts) {
     return undefined;
