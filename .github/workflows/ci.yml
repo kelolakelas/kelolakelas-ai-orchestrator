@@ -19,7 +19,7 @@ jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
@@ -37,12 +37,22 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/ai_orchestrator
       MIGRATION_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ai_orchestrator
+      # Sandbox confinement tests fail instead of skipping when bubblewrap cannot run.
+      REQUIRE_SANDBOX: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      - name: Install bubblewrap and PostgreSQL client tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap postgresql-client
+          # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor; production hosts must allow them for
+          # the command sandbox too.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc -- /bin/true
       - run: npm ci
       - name: Reject schema changes without a committed migration
         run: |
@@ -58,3 +68,13 @@ jobs:
       - run: npm run build
       - run: npm run lint
       - run: npm test
+      - name: Validate Prometheus alert rules
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD/ops/prometheus:/rules:ro" -w /rules prom/prometheus:v3.5.0 check rules alerts.yml
+          docker run --rm --entrypoint promtool -v "$PWD/ops/prometheus:/rules:ro" -w /rules prom/prometheus:v3.5.0 test rules alerts.test.yml
+      - name: Verify systemd units
+        run: |
+          for unit in systemd/*.service systemd/*.timer; do
+            systemd-analyze verify --man=no "$unit" 2>&1 | grep -vE "Failed to resolve (user|group)|is not executable|No such file" | tee /tmp/verify.log
+            if grep -q . /tmp/verify.log; then exit 1; fi
+          done

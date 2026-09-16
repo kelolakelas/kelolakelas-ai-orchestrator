@@ -1,0 +1,135 @@
+# Prometheus alert rules for the KelolaKelas AI orchestrator. Scrape GET /metrics with job="ai-orchestrator".
+# Thresholds assume the defaults in orchestrator.config.example.yaml; adjust them with the configuration.
+# Every alert names a section of the operations runbook (kelolakelas-docs/docs/runbooks/ai-orchestrator-operations.md).
+groups:
+  - name: ai-orchestrator-availability
+    rules:
+      - alert: OrchestratorDown
+        expr: up{job="ai-orchestrator"} == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: Orchestrator metrics endpoint is unreachable
+          runbook: "ai-orchestrator-operations.md#orchestrator-down"
+      - alert: OrchestratorTickStalled
+        expr: time() - orchestrator_scheduler_last_tick_timestamp_seconds > 600
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: No scheduler tick has completed for 10 minutes
+          runbook: "ai-orchestrator-operations.md#tick-stalled"
+      - alert: OrchestratorDatabaseMetricsFailing
+        expr: orchestrator_metrics_collector_up{collector="database"} == 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: The orchestrator cannot read PostgreSQL for metrics
+          runbook: "ai-orchestrator-operations.md#database-unavailable"
+      - alert: OrchestratorLinearIntakeFailing
+        expr: time() - orchestrator_intake_last_success_timestamp_seconds > 1800
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Linear intake has not succeeded for 30 minutes
+          runbook: "ai-orchestrator-operations.md#provider-outage"
+      - alert: OrchestratorKillSwitchEngaged
+        expr: max(orchestrator_kill_switch_engaged) == 1
+        for: 1m
+        labels: { severity: info }
+        annotations:
+          summary: The kill switch is engaged; no stage or maintenance runs
+          runbook: "ai-orchestrator-operations.md#kill-switch"
+
+  - name: ai-orchestrator-workflow
+    rules:
+      - alert: OrchestratorStaleLeases
+        expr: max(orchestrator_leases_stale) > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} expired lease(s) have not been recovered"
+          runbook: "ai-orchestrator-operations.md#stuck-workflow"
+      - alert: OrchestratorManualInterventionRequired
+        expr: max(orchestrator_tasks_manual_intervention) > 0
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} task(s) are blocked for manual intervention"
+          runbook: "ai-orchestrator-operations.md#manual-intervention"
+      - alert: OrchestratorQueueAgeHigh
+        expr: max(orchestrator_task_state_age_seconds_max{state="QUEUED"}) > 86400
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: A queued task has waited more than a day to start
+          runbook: "ai-orchestrator-operations.md#queue-not-draining"
+      - alert: OrchestratorExecutionStateStuck
+        expr: max by (state) (orchestrator_task_state_age_seconds_max{state=~"ANALYZING|READY|IMPLEMENTING|TESTING|FIXING|REVIEWING"}) > 14400
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "A task has been in {{ $labels.state }} for more than 4 hours"
+          runbook: "ai-orchestrator-operations.md#stuck-workflow"
+      - alert: OrchestratorInFlightStageLong
+        expr: max(orchestrator_in_flight_stage_age_seconds_max) > 10800
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: A running stage has not reached a boundary for 3 hours
+          runbook: "ai-orchestrator-operations.md#stuck-workflow"
+      - alert: OrchestratorCiWaitLong
+        expr: max(orchestrator_task_state_age_seconds_max{state="WAITING_CI"}) > 14400
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: A pull request has waited more than 4 hours for required checks
+          runbook: "ai-orchestrator-operations.md#ci-wait"
+      - alert: OrchestratorHumanReviewBacklog
+        expr: max(orchestrator_task_state_age_seconds_max{state="READY_FOR_HUMAN_REVIEW"}) > 259200
+        for: 1h
+        labels: { severity: info }
+        annotations:
+          summary: An orchestrator pull request has waited more than 3 days for review or merge
+          runbook: "ai-orchestrator-operations.md#ci-wait"
+      - alert: OrchestratorStageFailures
+        expr: sum(increase(orchestrator_stage_runs_total{outcome="failed"}[1h])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: A stage failed and blocked its task for manual intervention
+          runbook: "ai-orchestrator-operations.md#manual-intervention"
+      - alert: OrchestratorTasksFailed
+        expr: max(orchestrator_tasks{state="FAILED"}) > 0
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} task(s) exhausted their bounded attempts"
+          runbook: "ai-orchestrator-operations.md#manual-intervention"
+      - alert: OrchestratorRetryRateHigh
+        expr: sum(increase(orchestrator_attempts_total{category!~"succeeded|in_progress"}[6h])) > 20
+        labels: { severity: warning }
+        annotations:
+          summary: More than 20 unsuccessful stage attempts in 6 hours
+          runbook: "ai-orchestrator-operations.md#retries-and-limits"
+
+  - name: ai-orchestrator-providers
+    rules:
+      - alert: OrchestratorProviderCircuitOpen
+        expr: max by (provider) (orchestrator_provider_circuit_state) == 2
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "The {{ $labels.provider }} circuit breaker has been open for 15 minutes"
+          runbook: "ai-orchestrator-operations.md#provider-outage"
+      - alert: OrchestratorRunnerLimited
+        expr: max(orchestrator_claim_lane_held{lane="execution"}) == 1
+        for: 2h
+        labels: { severity: warning }
+        annotations:
+          summary: Execution claims have been held for 2 hours by a runner usage or rate limit
+          runbook: "ai-orchestrator-operations.md#retries-and-limits"
+      - alert: OrchestratorModelSpendHigh
+        expr: sum(increase(orchestrator_model_cost_usd_total[24h])) > 50
+        labels: { severity: warning }
+        annotations:
+          summary: "Estimated model spend in the last 24 hours is {{ $value | printf \"%.2f\" }} USD"
+          runbook: "ai-orchestrator-operations.md#retries-and-limits"
