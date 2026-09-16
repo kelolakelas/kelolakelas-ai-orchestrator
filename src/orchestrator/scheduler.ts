@@ -327,8 +327,10 @@ export class Scheduler {
     if (this.options.dryRun || this.stopping || controls === undefined || controls.pauseNewWork || this.killSwitchEngaged()) return 0;
     const work = this.claimableWork(controls);
     const { maxConcurrentTasks, maxConcurrentDeliveryTasks } = this.config.orchestrator;
-    // Delivery first: observing a pull request is short, and waiting for it must never hold an execution slot.
-    return await this.claimLane('delivery', work, maxConcurrentDeliveryTasks) + await this.claimLane('execution', work, maxConcurrentTasks);
+    // A lane refills its slots as claimed tasks finish. When stages finish quickly, as delivery observations of many
+    // waiting pull requests do, that refill never runs out of claimable work, so each lane claims for at most one polling
+    // interval. The tick then finishes, polls intake, and gives the other lane its turn.
+    return await this.claimLane('execution', work, maxConcurrentTasks) + await this.claimLane('delivery', work, maxConcurrentDeliveryTasks);
   }
 
   private async claimLane(lane: ClaimLane, work: ClaimableWork, limit: number): Promise<number> {
@@ -339,7 +341,8 @@ export class Scheduler {
     const hold = this.activeLaneHolds()[lane];
     if (hold !== undefined) return 0;
     let claimed = 0;
-    while (!this.stopping && this.inFlightIn(lane) < limit) {
+    const deadline = Date.now() + this.timing.pollIntervalMs;
+    while (!this.stopping && this.inFlightIn(lane) < limit && Date.now() < deadline) {
       const task = await this.options.tasks.claimNextTask({
         leaseOwner: this.options.workerId,
         leaseDurationMs: this.timing.leaseDurationMs,
