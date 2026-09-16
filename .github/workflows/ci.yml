@@ -9,10 +9,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  validate:
+  # `gate` is the required status check protecting `main`. Keep the job name stable; renaming it silently removes the
+  # merge gate until branch protection is updated.
+  gate:
+    name: gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16
@@ -37,7 +44,14 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run db:generate
+      - name: Reject schema changes without a committed migration
+        run: |
+          npm run db:generate
+          if [ -n "$(git status --porcelain -- migrations)" ]; then
+            git status --porcelain -- migrations
+            echo "::error::src/db/schema.ts differs from migrations/. Run 'npm run db:generate' and commit the result."
+            exit 1
+          fi
       - run: npm run test:migrations
       - run: npm run db:migrate
       - run: npm run test:repository
