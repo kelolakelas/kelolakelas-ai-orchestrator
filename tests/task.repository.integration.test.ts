@@ -9,6 +9,40 @@ const integrationDatabaseUrl = process.env.MIGRATION_TEST_DATABASE_URL;
 const describeIntegration = integrationDatabaseUrl === undefined ? describe.skip : describe;
 
 describeIntegration('task repository', () => {
+  it('counts delivery and execution leases separately and honors a waiting task resume time', async () => {
+    const pool = new pg.Pool({ connectionString: integrationDatabaseUrl });
+    const repository = new TaskRepository(drizzle(pool, { schema }));
+    try {
+      await resetDatabase(pool);
+      const create = (id: string) => repository.createTask({ linearIssueId: id, linearIdentifier: id, contractSnapshot: { id }, complexity: 'low', workUnits: [{ repository: 'web' }] });
+      const reviewing = await create('KEL-201');
+      const waiting = await create('KEL-202');
+      await create('KEL-203');
+      const now = new Date('2026-09-16T03:00:00.000Z');
+      const later = new Date(now.getTime() + 60_000);
+      await pool.query("UPDATE tasks SET state = 'WAITING_CI', lease_owner = 'worker-delivery', lease_expires_at = $2 WHERE id = $1", [reviewing.id, later]);
+      await pool.query("UPDATE tasks SET state = 'READY_FOR_HUMAN_REVIEW', resume_after = $2 WHERE id = $1", [waiting.id, later]);
+      const work = { queued: true, parkedStates: ['WAITING_CI', 'READY_FOR_HUMAN_REVIEW'] as const, scheduleResumeStates: [], limitResumeStates: [] };
+      const claim = (lane: 'delivery' | 'execution', at: Date, maxConcurrentTasks = 1) => repository.claimNextTask({ leaseOwner: `worker-${lane}`, leaseDurationMs: 60_000, now: at, work: { ...work, parkedStates: [...work.parkedStates] }, maxConcurrentTasks, lane });
+
+      // A leased delivery task does not use the execution slot, and the execution lane never claims delivery states.
+      expect(await claim('execution', now)).toMatchObject({ linearIdentifier: 'KEL-203', state: 'ANALYZING' });
+      expect(await claim('delivery', now)).toBeUndefined();
+      // The waiting task is not claimable before its resume time, even with a free delivery slot.
+      expect(await claim('delivery', now, 2)).toBeUndefined();
+      expect(await claim('delivery', later, 2)).toMatchObject({ id: waiting.id, state: 'READY_FOR_HUMAN_REVIEW', leaseOwner: 'worker-delivery' });
+
+      const deferred = await repository.deferTask(waiting.id, 'worker-delivery', new Date(later.getTime() + 60_000), 'GitHub 502');
+      expect(deferred).toMatchObject({ state: 'READY_FOR_HUMAN_REVIEW', leaseOwner: null, lastError: 'GitHub 502' });
+      await expect(repository.deferTask(waiting.id, 'worker-delivery', later)).rejects.toThrow('leased by another worker');
+      const history = await pool.query('SELECT 1 FROM state_transitions WHERE task_id = $1', [waiting.id]);
+      expect(history.rowCount).toBe(0);
+    } finally {
+      await resetDatabase(pool);
+      await pool.end();
+    }
+  });
+
   it('claims only ready tasks, records transitions, and blocks stale leases for manual recovery', async () => {
     const pool = new pg.Pool({ connectionString: integrationDatabaseUrl });
     const database = drizzle(pool, { schema });

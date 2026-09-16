@@ -5,7 +5,7 @@ import type * as schema from '../db/schema.js';
 import { externalOperations, intakeQuarantines, stateTransitions, taskAttempts, taskCheckpoints, taskDependencies, taskWorkUnits, tasks } from '../db/schema.js';
 import { canTransition, transitionTask as validateTransition } from '../orchestrator/state-machine.js';
 import type { ComplexityValue } from '../types/complexity.js';
-import type { AttemptCounter, PauseReason, TaskState } from '../types/domain.js';
+import { deliveryStates, type AttemptCounter, type ClaimLane, type PauseReason, type TaskState } from '../types/domain.js';
 
 export type Database = NodePgDatabase<typeof schema>;
 export type DatabaseTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
@@ -45,6 +45,17 @@ export class ContractChangedError extends Error {
     super(`Persisted contract changed for Linear issue: ${linearIssueId}`);
     this.name = 'ContractChangedError';
   }
+}
+
+export interface WorkUnitDeliveryUpdate {
+  /** Per-repository delivery progress: `PR_CREATED`, `WAITING_CI`, `READY_FOR_HUMAN_REVIEW`, `COMPLETED`, or `BLOCKED`. */
+  state?: TaskState;
+  /** Operator-visible explanation of the current delivery state. */
+  outcome?: string | null;
+  pushedCommit?: string;
+  pullRequest?: { number: number; url: string };
+  mergeCommit?: string | null;
+  observation?: Record<string, unknown>;
 }
 
 export interface CreateTaskInput {
@@ -98,7 +109,10 @@ export interface ClaimableWork {
 
 export interface TaskClaimWithLimitInput extends TaskClaimInput {
   work: ClaimableWork;
+  /** Leases held by tasks in the same lane count toward this limit. */
   maxConcurrentTasks: number;
+  /** `execution` (the default) claims every non-delivery state; `delivery` claims only parked delivery states. */
+  lane?: ClaimLane;
 }
 
 export interface LockedTransitionInput {
@@ -341,12 +355,20 @@ export class TaskRepository {
   async claimNextTask(input: TaskClaimWithLimitInput): Promise<PersistedTask | undefined> {
     if (input.leaseDurationMs <= 0) throw new Error('leaseDurationMs must be positive');
     const now = input.now ?? new Date();
-    const { work } = input;
+    const lane = input.lane ?? 'execution';
+    const inLane = (state: TaskState) => (lane === 'delivery') === deliveryStates.includes(state);
+    const work: ClaimableWork = {
+      queued: lane === 'execution' && input.work.queued,
+      parkedStates: input.work.parkedStates.filter(inLane),
+      scheduleResumeStates: lane === 'execution' ? input.work.scheduleResumeStates : [],
+      limitResumeStates: lane === 'execution' ? input.work.limitResumeStates : [],
+    };
     const blockers = alias(tasks, 'blocker_tasks');
 
     return this.db.transaction(async (transaction) => {
       await transaction.execute(sql`select pg_advisory_xact_lock(hashtext(${claimLockName}))`);
-      const leased = await transaction.select({ value: count() }).from(tasks).where(isNotNull(tasks.leaseOwner));
+      const laneCondition = lane === 'delivery' ? inArray(tasks.state, [...deliveryStates]) : notInArray(tasks.state, [...deliveryStates]);
+      const leased = await transaction.select({ value: count() }).from(tasks).where(and(isNotNull(tasks.leaseOwner), laneCondition));
       if ((leased[0]?.value ?? 0) >= input.maxConcurrentTasks) return undefined;
 
       const eligibility: SQL[] = [];
@@ -359,7 +381,8 @@ export class TaskRepository {
         eligibility.push(and(eq(tasks.state, 'QUEUED'), notExists(unresolvedBlockers)) as SQL);
       }
       if (work.parkedStates.length > 0) {
-        eligibility.push(inArray(tasks.state, [...work.parkedStates]));
+        // A stage that returned `wait` is claimable again only after its `resume_after`.
+        eligibility.push(and(inArray(tasks.state, [...work.parkedStates]), or(isNull(tasks.resumeAfter), lte(tasks.resumeAfter, now))) as SQL);
       }
       if (work.scheduleResumeStates.length > 0) {
         eligibility.push(and(eq(tasks.state, 'PAUSED_SCHEDULE'), inArray(tasks.resumeState, [...work.scheduleResumeStates])) as SQL);
@@ -452,6 +475,21 @@ export class TaskRepository {
         ...(patch.lastError === undefined ? {} : { lastError: patch.lastError }),
         ...(patch.requiresManualIntervention === undefined ? {} : { requiresManualIntervention: patch.requiresManualIntervention }),
       })
+      .where(and(eq(tasks.id, taskId), eq(tasks.leaseOwner, leaseOwner)))
+      .returning();
+    const task = updated[0];
+    if (!task) throw new LeaseOwnershipError(taskId);
+    return task;
+  }
+
+  /**
+   * Releases the lease and keeps the state, making the task claimable again only after `until`. Used by stages that
+   * wait on external systems; no transition is recorded because the state does not change.
+   */
+  async deferTask(taskId: string, leaseOwner: string, until: Date, lastError?: string | null): Promise<PersistedTask> {
+    const updated = await this.db
+      .update(tasks)
+      .set({ leaseOwner: null, leaseExpiresAt: null, lastHeartbeatAt: null, resumeAfter: until, updatedAt: new Date(), ...(lastError === undefined ? {} : { lastError }) })
       .where(and(eq(tasks.id, taskId), eq(tasks.leaseOwner, leaseOwner)))
       .returning();
     const task = updated[0];
@@ -582,17 +620,65 @@ export class TaskRepository {
     idempotencyKey: string;
     request: Record<string, unknown>;
   }): Promise<typeof externalOperations.$inferSelect> {
+    return (await this.beginExternalOperation(input)).operation;
+  }
+
+  /** Records the intent of an external side effect, or returns the existing record and `created: false`. */
+  async beginExternalOperation(input: {
+    taskId: string;
+    operationType: string;
+    idempotencyKey: string;
+    request: Record<string, unknown>;
+  }): Promise<{ operation: typeof externalOperations.$inferSelect; created: boolean }> {
     const inserted = await this.db.insert(externalOperations).values(input)
       .onConflictDoNothing()
       .returning();
-    if (inserted[0]) return inserted[0];
+    if (inserted[0]) return { operation: inserted[0], created: true };
 
     const existing = await this.db.select().from(externalOperations)
       .where(eq(externalOperations.idempotencyKey, input.idempotencyKey))
       .limit(1);
     const operation = existing[0];
     if (!operation) throw new Error(`External operation not found: ${input.idempotencyKey}`);
-    return operation;
+    return { operation, created: false };
+  }
+
+  /** Records the observed result of an external side effect. Only the task's lease owner may complete it. */
+  async completeExternalOperation(input: { operationId: string; taskId: string; leaseOwner: string; response: Record<string, unknown> }): Promise<void> {
+    const leased = this.db.select({ id: tasks.id }).from(tasks).where(and(eq(tasks.id, input.taskId), eq(tasks.leaseOwner, input.leaseOwner)));
+    const updated = await this.db.update(externalOperations)
+      .set({ status: 'SUCCEEDED', response: input.response, completedAt: new Date() })
+      .where(and(eq(externalOperations.id, input.operationId), eq(externalOperations.taskId, input.taskId), exists(leased)))
+      .returning({ id: externalOperations.id });
+    if (!updated[0]) throw new LeaseOwnershipError(input.taskId);
+  }
+
+  async listExternalOperations(taskId: string): Promise<Array<typeof externalOperations.$inferSelect>> {
+    return this.db.select().from(externalOperations).where(eq(externalOperations.taskId, taskId)).orderBy(asc(externalOperations.startedAt));
+  }
+
+  /** Persists a work unit's delivery identity and latest observation while the caller holds the parent task lease. */
+  async recordWorkUnitDelivery(taskId: string, leaseOwner: string, repository: string, delivery: WorkUnitDeliveryUpdate): Promise<PersistedWorkUnit> {
+    const leased = this.db.select({ id: tasks.id }).from(tasks).where(and(eq(tasks.id, taskId), eq(tasks.leaseOwner, leaseOwner)));
+    const updates: PgUpdateSetSource<typeof taskWorkUnits> = { updatedAt: new Date() };
+    if (delivery.state !== undefined) updates.state = delivery.state;
+    if (delivery.outcome !== undefined) updates.outcome = delivery.outcome;
+    if (delivery.pushedCommit !== undefined) updates.pushedCommit = delivery.pushedCommit;
+    if (delivery.pullRequest !== undefined) {
+      updates.pullRequestNumber = delivery.pullRequest.number;
+      updates.pullRequestUrl = delivery.pullRequest.url;
+    }
+    if (delivery.mergeCommit !== undefined) updates.mergeCommit = delivery.mergeCommit;
+    if (delivery.observation !== undefined) {
+      updates.deliveryObservation = delivery.observation;
+      updates.deliveryObservedAt = new Date();
+    }
+    const updated = await this.db.update(taskWorkUnits)
+      .set(updates)
+      .where(and(eq(taskWorkUnits.taskId, taskId), eq(taskWorkUnits.repository, repository), exists(leased)))
+      .returning();
+    if (!updated[0]) throw new LeaseOwnershipError(taskId);
+    return updated[0];
   }
 
   async recoverExpiredLeases(now = new Date()): Promise<PersistedTask[]> {
@@ -627,7 +713,7 @@ export class TaskRepository {
           }));
           continue;
         }
-        // States such as READY_FOR_HUMAN_REVIEW cannot enter BLOCKED; flag them without an illegal transition.
+        // Defensive: a state without a BLOCKED transition is flagged without an illegal transition.
         const updated = await transaction.update(tasks)
           .set({ leaseOwner: null, leaseExpiresAt: null, lastHeartbeatAt: null, requiresManualIntervention: true, lastError: reason, updatedAt: new Date() })
           .where(eq(tasks.id, task.id))

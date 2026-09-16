@@ -1,5 +1,5 @@
-import { count, desc, eq, sql } from 'drizzle-orm';
-import { operatorActions, orchestratorControls, taskAttempts, tasks } from '../db/schema.js';
+import { asc, count, desc, eq, sql } from 'drizzle-orm';
+import { operatorActions, orchestratorControls, taskAttempts, taskWorkUnits, tasks } from '../db/schema.js';
 import { canTransition } from '../orchestrator/state-machine.js';
 import type { ScheduleOverride, TaskState } from '../types/domain.js';
 import { transitionLockedTask, type Database, type DatabaseTransaction, type PersistedTask } from './task.repository.js';
@@ -67,6 +67,23 @@ export interface TaskAttemptView {
   usage: Record<string, unknown> | null;
   startedAt: Date;
   completedAt: Date | null;
+}
+
+/** Operator-visible repository work unit: workspace identity and delivery progress, including partial delivery. */
+export interface WorkUnitView {
+  repository: string;
+  state: TaskState;
+  outcome: string | null;
+  branch: string | null;
+  baseCommit: string | null;
+  workspaceReleasedAt: Date | null;
+  workspaceCleanupBlockedReason: string | null;
+  pushedCommit: string | null;
+  pullRequestNumber: number | null;
+  pullRequestUrl: string | null;
+  mergeCommit: string | null;
+  deliveryObservation: Record<string, unknown> | null;
+  deliveryObservedAt: Date | null;
 }
 
 const taskStatusColumns = {
@@ -216,6 +233,24 @@ export class OperatorRepository {
       startedAt: taskAttempts.startedAt,
       completedAt: taskAttempts.completedAt,
     }).from(taskAttempts).where(eq(taskAttempts.taskId, taskId)).orderBy(desc(taskAttempts.startedAt)).limit(limit);
+  }
+
+  async listWorkUnits(taskId: string): Promise<WorkUnitView[]> {
+    return this.db.select({
+      repository: taskWorkUnits.repository,
+      state: taskWorkUnits.state,
+      outcome: taskWorkUnits.outcome,
+      branch: taskWorkUnits.branch,
+      baseCommit: taskWorkUnits.baseCommit,
+      workspaceReleasedAt: taskWorkUnits.workspaceReleasedAt,
+      workspaceCleanupBlockedReason: taskWorkUnits.workspaceCleanupBlockedReason,
+      pushedCommit: taskWorkUnits.pushedCommit,
+      pullRequestNumber: taskWorkUnits.pullRequestNumber,
+      pullRequestUrl: taskWorkUnits.pullRequestUrl,
+      mergeCommit: taskWorkUnits.mergeCommit,
+      deliveryObservation: taskWorkUnits.deliveryObservation,
+      deliveryObservedAt: taskWorkUnits.deliveryObservedAt,
+    }).from(taskWorkUnits).where(eq(taskWorkUnits.taskId, taskId)).orderBy(asc(taskWorkUnits.repository));
   }
 
   async listActions(taskId?: string, limit = 100): Promise<Array<typeof operatorActions.$inferSelect>> {

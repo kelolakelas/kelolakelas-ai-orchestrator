@@ -18,7 +18,7 @@ async function resetDatabase(client: Client): Promise<void> {
 
 // Schema resets and DDL fsync heavily; allow for slow disks rather than the 5 second default.
 describeMigration('database migrations', { timeout: 60_000 }, () => {
-  it('preserves Phase 1 tasks and Phase 4 attempts through every migration', async () => {
+  it('preserves Phase 1 tasks, Phase 4 attempts, and work units through every migration', async () => {
     const client = new Client({ connectionString: migrationDatabaseUrl });
     await client.connect();
 
@@ -43,6 +43,10 @@ describeMigration('database migrations', { timeout: 60_000 }, () => {
       const phase4 = await client.query<{ id: string }>('SELECT id FROM tasks WHERE linear_issue_id = $1', ['issue-1']);
       await client.query("INSERT INTO task_attempts (task_id, stage, attempt, result) VALUES ($1, 'ANALYZING', 1, '{\"legacy\": true}')", [phase4.rows[0]?.id]);
       await applyMigration(client, '0006_phase5_agent_attempts.sql');
+      await client.query("INSERT INTO task_work_units (task_id, repository, branch) VALUES ($1, 'web', 'kel-1-legacy')", [phase4.rows[0]?.id]);
+      await applyMigration(client, '0007_phase6_delivery.sql');
+      const unit = await client.query('SELECT branch, pushed_commit, pull_request_number, merge_commit, delivery_observation FROM task_work_units');
+      expect(unit.rows).toEqual([{ branch: 'kel-1-legacy', pushed_commit: null, pull_request_number: null, merge_commit: null, delivery_observation: null }]);
       const attempt = await client.query<{ result: unknown; input: unknown; evidence: unknown; usage: unknown }>('SELECT result, input, evidence, usage FROM task_attempts');
       expect(attempt.rows).toEqual([{ result: { legacy: true }, input: null, evidence: null, usage: null }]);
       const upgraded = await client.query<{ complexity: string; resume_after: Date | null; cancel_requested_at: Date | null }>(
@@ -60,7 +64,8 @@ describeMigration('database migrations', { timeout: 60_000 }, () => {
         "SELECT indexname FROM pg_indexes WHERE tablename = 'task_work_units' AND indexname LIKE 'task_work_units_%_unique' ORDER BY indexname",
       );
       expect(workspaceIndexes.rows.map((row) => row.indexname)).toEqual([
-        'task_work_units_repository_branch_unique', 'task_work_units_task_repository_unique', 'task_work_units_workspace_path_unique',
+        'task_work_units_repository_branch_unique', 'task_work_units_repository_pull_request_unique', 'task_work_units_task_repository_unique',
+        'task_work_units_workspace_path_unique',
       ]);
     } finally {
       await resetDatabase(client);

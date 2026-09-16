@@ -140,6 +140,35 @@ describe('scheduler', () => {
     await stable.stop();
   });
 
+  it('claims delivery work in its own lane before execution work, each with its own limit', async () => {
+    const parts = fakes();
+    const { instance } = scheduler(parts, { handlers: { ANALYZING: noopHandler, WAITING_CI: noopHandler } });
+    await instance.runOnce();
+    expect(parts.tasks.claimNextTask.mock.calls.map(([input]) => [input.lane, input.maxConcurrentTasks])).toEqual([['delivery', 2], ['execution', 1]]);
+
+    const executionOnly = fakes();
+    await scheduler(executionOnly, { handlers: { ANALYZING: noopHandler } }).instance.runOnce();
+    expect(executionOnly.tasks.claimNextTask.mock.calls.map(([input]) => input.lane)).toEqual(['execution']);
+  });
+
+  it('releases the lease without a transition when a stage waits', async () => {
+    const parts = fakes();
+    const task = { id: 'task-1', linearIdentifier: 'KEL-1', state: 'WAITING_CI', leaseOwner: 'worker-test', cancelRequestedAt: null, requiresManualIntervention: false };
+    const until = new Date(insideHours.getTime() + 120_000);
+    const extra = parts.tasks as typeof parts.tasks & Record<string, ReturnType<typeof vi.fn>>;
+    extra.getTask = vi.fn().mockResolvedValue(task);
+    extra.deferTask = vi.fn().mockResolvedValue({ ...task, leaseOwner: null, resumeAfter: until });
+    extra.transitionTask = vi.fn();
+    parts.tasks.claimNextTask.mockResolvedValueOnce(task);
+    const handler = { run: vi.fn().mockResolvedValue({ kind: 'wait', until, reason: 'Waiting for required checks', lastError: null }) };
+    const { instance, log } = scheduler(parts, { handlers: { WAITING_CI: handler } });
+    await instance.runOnce();
+    await instance.drain();
+    expect(extra.deferTask).toHaveBeenCalledWith('task-1', 'worker-test', until, null);
+    expect(extra.transitionTask).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith('task_waiting', expect.objectContaining({ taskId: 'task-1', until, reason: 'Waiting for required checks' }));
+  });
+
   it('reports a tick that runs past the stuck threshold as not live', async () => {
     const parts = fakes();
     let now = insideHours;

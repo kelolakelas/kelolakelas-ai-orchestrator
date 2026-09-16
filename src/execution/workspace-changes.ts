@@ -1,6 +1,15 @@
 import type { GitRunner } from '../workspaces/git.js';
 import type { AddedLine, ChangedFile, RepositoryChanges } from './diff-policy.js';
 
+export interface RangeCommit {
+  sha: string;
+  authorName: string;
+  authorEmail: string;
+  parents: string[];
+  /** Values of `Orchestrator-Task` trailers. */
+  taskTrailers: string[];
+}
+
 /** Parses `git diff --raw -z --no-renames` into path, status, and resulting mode. */
 export function parseRawDiff(output: string): Array<Pick<ChangedFile, 'path' | 'status' | 'mode'>> {
   const fields = output.split('\0');
@@ -78,6 +87,38 @@ export class WorkspaceChanges {
     }
     const patch = await this.git.output(['-c', 'core.quotePath=false', 'diff', '--cached', '-U0', '--no-color', '--no-renames', '--no-ext-diff', '--no-textconv', 'HEAD'], cwd);
     return { repository, files, addedLines: parseAddedLines(patch), patchSkipped: false };
+  }
+
+  /**
+   * Reads the committed change between two commits, in the same shape the diff policy inspects before a commit. Used to
+   * re-inspect the cumulative branch content immediately before it leaves the host.
+   */
+  async collectRange(repository: string, workspacePath: string, base: string, head: string, maxChangedLines: number): Promise<RepositoryChanges> {
+    const cwd = { cwd: workspacePath };
+    const raw = parseRawDiff((await this.git.run(['diff', '--raw', '-z', '--no-renames', '--no-ext-diff', base, head], cwd)).stdout);
+    const numstat = parseNumstat((await this.git.run(['diff', '--numstat', '-z', '--no-renames', '--no-ext-diff', base, head], cwd)).stdout);
+    const files: ChangedFile[] = raw.map((entry) => ({
+      ...entry,
+      addedLines: numstat.get(entry.path)?.added ?? null,
+      deletedLines: numstat.get(entry.path)?.deleted ?? null,
+    }));
+    const totalLines = files.reduce((total, file) => total + (file.addedLines ?? 0) + (file.deletedLines ?? 0), 0);
+    if (files.length === 0 || totalLines > maxChangedLines) {
+      return { repository, files, addedLines: [], patchSkipped: files.length > 0 };
+    }
+    const patch = await this.git.output(['-c', 'core.quotePath=false', 'diff', '-U0', '--no-color', '--no-renames', '--no-ext-diff', '--no-textconv', base, head], cwd);
+    return { repository, files, addedLines: parseAddedLines(patch), patchSkipped: false };
+  }
+
+  /** Commits reachable from `head` but not `base`, newest first, with author, parents, and the orchestrator task trailer. */
+  async commitsInRange(workspacePath: string, base: string, head: string): Promise<RangeCommit[]> {
+    const output = await this.git.output([
+      'log', '--no-color', '--format=%H%x00%an%x00%ae%x00%P%x00%(trailers:key=Orchestrator-Task,valueonly,separator=%x2C)%x1e', `${base}..${head}`,
+    ], { cwd: workspacePath });
+    return output.split('\x1e').map((record) => record.trim()).filter(Boolean).map((record) => {
+      const [sha = '', authorName = '', authorEmail = '', parents = '', task = ''] = record.split('\0');
+      return { sha, authorName, authorEmail, parents: parents.split(' ').filter(Boolean), taskTrailers: task.split(',').map((value) => value.trim()).filter(Boolean) };
+    });
   }
 
   /** HEAD and porcelain status, used to prove that a read-only agent changed nothing. */

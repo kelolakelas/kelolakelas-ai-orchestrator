@@ -32,6 +32,7 @@ async function serve(overrides: Partial<HttpServerOptions> = {}) {
     getTaskStatus: vi.fn().mockResolvedValue(undefined),
     listActions: vi.fn().mockResolvedValue([]),
     listAttempts: vi.fn().mockResolvedValue([]),
+    listWorkUnits: vi.fn().mockResolvedValue([]),
   };
   const server = createHttpServer({
     scheduler: { isLive: () => true, status: () => status() },

@@ -1,6 +1,6 @@
 # AI Software Engineering Orchestrator
 
-Production-oriented MVP for deterministic orchestration of AI-assisted software engineering work. The orchestrator owns workflow state, scheduling, retries, persistence, and delivery gates. AI runners will be added in later phases and return structured results only.
+Production-oriented MVP for deterministic orchestration of AI-assisted software engineering work. The orchestrator owns workflow state, scheduling, retries, persistence, and delivery gates. AI runners return structured results only.
 
 ## Phase 1
 
@@ -23,9 +23,11 @@ Phase 4 adds isolated repository preparation: a trusted repository registry, det
 
 Phase 5 adds supervised agent execution: a structured analyzer, a write-enabled implementer, trusted repository quality gates, bounded fix cycles, and a structured reviewer, with a diff policy and Git ownership checks before every local commit.
 
-Not yet implemented: push, GitHub pull requests, CI polling, merge observation, and Linear status updates.
+Phase 6 adds GitHub delivery and Linear synchronization: it pushes reviewed branches, opens exactly one pull request per repository, observes required checks, reviews, and merges on GitHub, links pull requests and delivery milestones to the Linear issue, and completes a task only when every pull request is merged and reachable from its base branch.
 
-Consequently, by default the running service audits Linear intake, persists eligible tasks, recovers expired leases, and applies operator controls, but claims no task. With `orchestrator.execution.prepareWorkspaces: true` it claims tasks, prepares their worktrees, and parks them in `BLOCKED`. With `runAgents: true` as well, it analyzes, implements, tests, fixes, and reviews each task, then parks a reviewed local branch in `BLOCKED`. It never pushes, opens a pull request, or merges.
+Not implemented by design: merging, deployment, and changing a Linear issue's status.
+
+Consequently, by default the running service audits Linear intake, persists eligible tasks, recovers expired leases, and applies operator controls, but claims no task. With `orchestrator.execution.prepareWorkspaces: true` it claims tasks, prepares their worktrees, and parks them in `BLOCKED`. With `runAgents: true` as well, it analyzes, implements, tests, fixes, and reviews each task, then parks a reviewed local branch in `BLOCKED`. With `deliver: true` as well, it pushes and opens pull requests, waits for required checks and human merges, and completes the task. It never merges.
 
 ## Architecture
 
@@ -74,6 +76,7 @@ npm run dev
 - `schedule.minimumRemainingMinutes*` guards
 - `schedule.allowMechanicalOperationsOutsideHours` for future CI/status checks
 - `orchestrator.maxConcurrentTasks`, enforced across every process that shares the database
+- `orchestrator.maxConcurrentDeliveryTasks` (default `2`), a separate limit for tasks in delivery states
 - `orchestrator.pollingIntervalSeconds`, the delay between scheduler ticks
 - `orchestrator.leaseDurationSeconds` and `orchestrator.heartbeatIntervalSeconds`; the heartbeat must be at most half the lease
 - `orchestrator.shutdownGracePeriodSeconds`, how long `SIGTERM`/`SIGINT` waits for running stages to park
@@ -82,6 +85,8 @@ npm run dev
 - `orchestrator.execution.prepareWorkspaces` registers the workspace preparation stage (default `false`)
 - `orchestrator.execution.runAgents` registers the Phase 5 agent stages (default `false`); requires `prepareWorkspaces`, `agents`, every routed model tier (`luna`, `terra`, `sol`), and quality checks for every repository
 - `workspace.root`, `minimumFreeDiskMb`, `gitTimeoutSeconds`, `repositoryLockTimeoutSeconds`, and `remoteRetryMinutes`
+- `orchestrator.execution.deliver` registers the Phase 6 delivery stages (default `false`); requires `runAgents`, `delivery`, and `GITHUB_TOKEN`
+- `delivery.github` (`apiUrl`, `requestTimeoutMs`, `maxRetries`), `delivery.pollIntervalSeconds`, `retryIntervalSeconds`, `requiredChecksTimeoutMinutes`, `draftPullRequests`, and `linearComments`
 - `repositories.<name>` for each contract repository (`web`, `api-gateway`, `academic`, `identity`, `billing`): absolute local clone `path`, `github` as `owner/name`, `remote` (default `origin`), and `baseBranch` (default `main`)
 - `repositories.<name>.quality`: ordered `setup` and `checks` commands (`name`, argument array `command`, `timeoutSeconds`), extra `environment` variable names for those commands, and approved `documentation` files
 - `agents.runner`: absolute Codex CLI `executable`, extra runner `environment` names, per-stage `timeoutMinutes`, `maxResultBytes`, `maxEventBytes`, and `rateLimitRetryMinutes`
@@ -96,6 +101,7 @@ Environment variables:
 - `DATABASE_URL` and `LINEAR_API_KEY` are required.
 - `ORCHESTRATOR_DRY_RUN=true` reports intake decisions without writing to PostgreSQL, Linear, or GitHub, and rejects operator mutations.
 - `ORCHESTRATOR_OPERATOR_TOKEN` enables the operator API. Without it, `/operator/*` returns 404.
+- `GITHUB_TOKEN` is required when `deliver` is true. It authenticates GitHub API reads and pull request creation only; it never reaches Git, agents, or quality commands. Pushes use the service user's Git credentials, like fetches.
 - `ORCHESTRATOR_WORKER_ID` sets a stable worker identity. It must be unique per process. When set, leases held by a previous process with the same identity are recovered at startup instead of waiting for expiry.
 
 ## Planning intake contract
@@ -137,13 +143,13 @@ Each tick, spaced by `pollingIntervalSeconds` after the previous tick completes:
 3. polls Linear intake (read-only, so it runs regardless of schedule and pause);
 4. claims executable tasks until `maxConcurrentTasks` leases exist.
 
-Claims run in one transaction under a PostgreSQL advisory lock that counts every leased task, so the limit holds across processes. A task is claimable when it has no lease, no manual-intervention flag, and no pending cancellation, and a stage handler exists for the stage it would run:
+Claims run in one transaction under a PostgreSQL advisory lock that counts leased tasks, so the limit holds across processes. Delivery states (`PR_CREATED`, `WAITING_CI`, `READY_FOR_HUMAN_REVIEW`) form a separate claim lane limited by `maxConcurrentDeliveryTasks`, claimed before execution work, so a pull request that waits days for review never occupies an execution slot. A task is claimable when it has no lease, no manual-intervention flag, and no pending cancellation, and a stage handler exists for the stage it would run:
 
 - `QUEUED` with all blockers `COMPLETED`, when both the new-task and analysis schedule gates are open;
 - `PAUSED_SCHEDULE` or `PAUSED_LIMIT` whose `resumeState` gate is open (a limit pause also waits for `resume_after`);
-- an active stage parked at a boundary, such as after a graceful shutdown.
+- an active stage parked at a boundary, such as after a graceful shutdown, once its `resume_after` (set by a waiting stage) has passed.
 
-A claimed task runs stage by stage through `StageHandler` implementations. The lease is renewed every `heartbeatIntervalSeconds`, and heartbeats never overlap. Before every stage the worker re-reads the task and controls, then, in order: applies a pending cancellation, hands the task to manual intervention, parks when stopping or when new work is paused, parks when no handler exists, or enters `PAUSED_SCHEDULE` with `resumeState` when the stage gate is closed. Handlers receive an `AbortSignal` and checkpoint helpers; they return `advance`, `pause-limit`, or `interrupted`. A handler error blocks the task for manual intervention with a bounded `last_error`. A result arriving after the lease was lost is discarded.
+A claimed task runs stage by stage through `StageHandler` implementations. The lease is renewed every `heartbeatIntervalSeconds`, and heartbeats never overlap. Before every stage the worker re-reads the task and controls, then, in order: applies a pending cancellation, hands the task to manual intervention, parks when stopping or when new work is paused, parks when no handler exists, or enters `PAUSED_SCHEDULE` with `resumeState` when the stage gate is closed. Handlers receive an `AbortSignal` and checkpoint helpers; they return `advance`, `pause-limit`, `wait`, or `interrupted`. `wait` keeps the state, releases the lease, and sets `resume_after`, without a transition record. A handler error blocks the task for manual intervention with a bounded `last_error`. A result arriving after the lease was lost is discarded.
 
 AI stages (analysis, implementation, fix, review) need an open window with enough remaining time. Mechanical stages (testing, delivery, CI observation) may run outside hours when `allowMechanicalOperationsOutsideHours` is true. With `finishCurrentStep: false`, a running AI stage is interrupted when its window closes.
 
@@ -182,7 +188,7 @@ With `runAgents` enabled, a claimed task runs these stages. Each one is a stage 
 | `IMPLEMENTING` | A workspace-write implementer changes the worktrees; the orchestrator verifies Git state, applies the diff policy, and commits locally | `TESTING` | Timeout, runner failure, invalid output, or rejected diff: discard changes and retry through `READY` with the next escalation route; `FAILED` after `maxImplementationAttempts` |
 | `TESTING` | Run `setup` and every `check`, then discard artifacts | `REVIEWING` | Request a fix (`FIXING`); `FAILED` after `maxQualityFixAttempts`; a command that cannot start blocks for manual intervention |
 | `FIXING` | A workspace-write fixer addresses the failing output or review findings, with the same checks as implementation | `TESTING` | An unapplied or rejected fix returns to `TESTING`, which consumes the next bounded attempt |
-| `REVIEWING` | A read-only reviewer inspects the committed diff | `BLOCKED` with the reason `Reviewed local branch ready; delivery is not enabled` and no manual-intervention flag | Requested changes: `FIXING`; `FAILED` after `maxReviewCycles`. Rejection or invalid output: `BLOCKED` for manual intervention |
+| `REVIEWING` | A read-only reviewer inspects the committed diff | `PR_CREATED` when delivery is enabled; otherwise `BLOCKED` with the reason `Reviewed local branch ready; delivery is not enabled` and no manual-intervention flag | Requested changes: `FIXING`; `FAILED` after `maxReviewCycles`. Rejection or invalid output: `BLOCKED` for manual intervention |
 
 A reviewer approval with a blocker or major finding counts as a change request. Provider usage limits pause the task in `PAUSED_LIMIT` (`CODEX_USAGE_LIMIT`, using the provider's retry hint or `usageLimitPauseMinutes`), and rate limits pause it with `RATE_LIMIT` for `rateLimitRetryMinutes`. Pauses and cancellations do not consume an attempt. Implementation attempts, quality fixes, and review cycles are counted on the task and each increment is written in the transition that consumes it. An operator retry of a `FAILED` task resets the counters for one new bounded cycle.
 
@@ -202,13 +208,48 @@ Every stage checkpoints its result against the exact commits it verified: an acc
 - binary content outside `allowedBinaryPaths`, a symbolic link, or a submodule;
 - an added line matching a credential pattern or the literal value of a credential in the orchestrator environment.
 
-Commits use `agents.commitAuthor`, run with hooks disabled, and carry `Orchestrator-Task` and `Orchestrator-Stage` trailers. Nothing is pushed.
+Commits use `agents.commitAuthor`, run with hooks disabled, and carry `Orchestrator-Task` and `Orchestrator-Stage` trailers. Nothing is pushed until delivery re-verifies the branch.
 
 **Quality gates.** `setup` and `checks` come only from `repositories.<name>.quality` and run as argument arrays in the worktree, without a shell, with a timeout, bounded output, and process-group termination. They receive `PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `CI=true`, and the names in `quality.environment`. Configuration rejects orchestrator credentials, `OPENAI_API_KEY`, and `CODEX_API_KEY` there. Output tails are redacted before they are stored or shown to a fixer.
 
 **Evidence.** Each stage run is a `task_attempts` row with its normalized `input`, schema-validated `result`, redacted `evidence` (quality outcomes, diff statistics, policy findings, commits), `usage` tokens, and `failure_category`. `GET /operator/tasks/:id` returns them with the task's attempt counters and selected model tier.
 
-**Trust boundary limits.** Quality commands execute code written by the agent, outside the Codex sandbox, with the service user's permissions minus credentials. The read-only sandbox limits writes, not reads: an agent can read any file the service user can read. Run the service as a dedicated user that cannot read secrets or other users' files, keep `/etc/ai-orchestrator/orchestrator.env` root-owned, and do not enable push or pull-request delivery until a stronger isolation boundary is evaluated.
+**Trust boundary limits.** Quality commands execute code written by the agent, outside the Codex sandbox, with the service user's permissions minus credentials. The read-only sandbox limits writes, not reads: an agent can read any file the service user can read. Run the service as a dedicated user that cannot read secrets or other users' files, and keep `/etc/ai-orchestrator/orchestrator.env` root-owned. Delivery raises the stakes: see [Delivery trust boundary](#delivery-trust-boundary).
+
+## GitHub delivery and Linear synchronization
+
+With `deliver` enabled, a reviewed task continues through three delivery stages. They run in the delivery claim lane and are mechanical, so they follow `allowMechanicalOperationsOutsideHours`.
+
+| Stage | Work | Success | Waits | Blocks for manual intervention |
+|---|---|---|---|---|
+| `PR_CREATED` | Verify, push, and create or recover one pull request per repository; link each to the Linear issue | `WAITING_CI` | GitHub, Git remote, or Linear unavailable or rate limited | Unapproved or ungated commits, a foreign commit or diff-policy violation, a diverged or deleted remote branch, a closed, duplicated, retargeted, or rewritten pull request, an archived repository, or a GitHub rejection |
+| `WAITING_CI` | Observe every pull request's required checks | `READY_FOR_HUMAN_REVIEW` when every open pull request passed its required checks (merged ones count) | Required checks missing or pending, every `pollIntervalSeconds` | A failed, skipped, cancelled, or otherwise unsuccessful required check; checks still missing or pending after `requiredChecksTimeoutMinutes`; no required checks at all; merge conflicts; a closed, retargeted, or force-pushed pull request |
+| `READY_FOR_HUMAN_REVIEW` | Observe reviews and merges | `COMPLETED` when every pull request is merged and its merge commit is reachable from the remote base branch; back to `WAITING_CI` when a head moved and checks run again | Awaiting review or merge; a merge commit not yet reachable | As in `WAITING_CI`, plus a merge commit that stays unreachable past the timeout |
+
+**Before anything leaves the host**, `PR_CREATED` requires the review approval and quality pass checkpoints for the current commits and re-verifies each worktree's ownership and registered remote. Every commit between the base and the head must be a single-parent commit by `agents.commitAuthor` carrying this task's `Orchestrator-Task` trailer. The cumulative diff is re-inspected against the diff policy's content rules (forbidden and generated paths, binaries, symbolic links, submodules, and secrets). The push is `git push --porcelain --no-verify <remote> <commit>:refs/heads/<branch>`: never forced, with hooks disabled.
+
+**Required checks and approvals come from GitHub.** Each observation reads the base branch's classic protection and rulesets. Only an explicit `success` counts; a requirement pinned to a GitHub App matches only that app's check runs. A base branch that requires no checks is treated as a misconfigured merge gate. Approvals are observed and reported, including the ruleset's required count when GitHub exposes it; GitHub enforces them at merge. Nothing in a Linear issue can supply check, approval, or merge state.
+
+**The orchestrator never merges.** A pull request whose head moves forward from the reviewed commit, for example through "Update branch", stays valid and its checks are observed again. A head that no longer contains the reviewed commit is treated as a force-push.
+
+**Partial delivery.** Each repository work unit records its own delivery state (`PR_CREATED`, `WAITING_CI`, `READY_FOR_HUMAN_REVIEW`, `COMPLETED`, or `BLOCKED`), outcome, pushed commit, pull request, merge commit, and latest GitHub observation. The parent task completes only when every work unit is `COMPLETED`.
+
+**Idempotency.** Every side effect first records an intent row in `external_operations` keyed by task, repository, and commit or event, and each one is reconciled with the external system before it acts:
+
+- A push reads the remote branch first.
+- A pull request is looked up by head branch, and GitHub refuses a second open pull request for the same head.
+- A Linear comment carries its key in the body and is looked up after an unrecorded attempt.
+- A Linear attachment is keyed by URL.
+
+A retry after a crash, a lost response, or an operator retry therefore converges without duplicates. Writes are never retried blindly inside the GitHub or Linear adapters.
+
+**Linear.** Pull requests are attached to the issue. When `linearComments` is true, one comment is posted per milestone: pull requests opened, required checks passed, delivery blocked, and every pull request merged. The orchestrator never changes an issue's status; a person moves it to Done after checking the acceptance criteria. Milestone comments are retried until they succeed; a blocked notification is best effort and never delays blocking.
+
+**GitHub access.** `GITHUB_TOKEN` must be able to read repository metadata, branch protection or rulesets, pull requests, check runs, commit statuses, and reviews, and to create pull requests. Pushes use the service user's Git credentials, so that account needs push access to task branches only. Protect `main` so the account cannot push to it.
+
+### Delivery trust boundary
+
+Quality commands run agent-written code as the service user. On Linux, a process running as the same user can read the orchestrator's initial environment (`/proc/<pid>/environ`), which includes `GITHUB_TOKEN` and the other credentials, and can use the user's Git credentials. The environment allowlists in this service do not prevent that. Until quality commands and agents run under a separate user or a container without those credentials, keep `deliver` disabled in production, or accept that a malicious change can act with the token's permissions before a human reviews it. Use a fine-grained token limited to the registered repositories, and branch protection that requires review.
 
 ## Pause and resume behavior
 
@@ -231,7 +272,7 @@ The HTTP server binds to `127.0.0.1:8089` by default. Do not expose it publicly.
 | `GET /healthz` | none | 200 unless a scheduler tick has run longer than the stuck threshold |
 | `GET /readyz` | none | 200 only when PostgreSQL answers, the last Linear poll succeeded, and the worker is not stopping |
 | `GET /status` | none | worker state, last tick and intake result, in-flight tasks, and task counts by state |
-| `GET /operator/controls`, `/operator/tasks`, `/operator/tasks/:id`, `/operator/actions` | bearer | controls, task status with lease, error, attempt-counter, and model fields, stage attempts (task detail), and the audit log |
+| `GET /operator/controls`, `/operator/tasks`, `/operator/tasks/:id`, `/operator/actions` | bearer | controls, task status with lease, error, attempt-counter, and model fields, per-repository work units with delivery state and pull requests, stage attempts (task detail), and the audit log |
 | `POST /operator/pause`, `/operator/resume` | bearer | stop or allow new claims across all workers; in-flight tasks park at the next stage boundary |
 | `POST /operator/schedule-override` | bearer | set `normal`, `enabled`, or `disabled` |
 | `POST /operator/tasks/:id/retry` | bearer | re-queue a `BLOCKED` or `FAILED` task and clear its manual-intervention markers |
@@ -268,6 +309,9 @@ Secrets belong only in the environment file or service manager secret mechanism.
 - A `BLOCKED` task with `requires_manual_intervention` was recovered from an expired lease, failed a stage, or was flagged by an operator. Inspect `GET /operator/tasks/:id` and its audit history, then retry or cancel it.
 - If a task is paused, inspect its persisted `resume_state`, `pause_reason`, and attempt counters before resuming it.
 - A `BLOCKED` task without `requires_manual_intervention` whose last transition reason is `Reviewed local branch ready; delivery is not enabled` has a committed, gated, reviewed branch in its worktrees. Inspect it with `git log <base>..HEAD` in each worktree.
+- A task in `WAITING_CI` or `READY_FOR_HUMAN_REVIEW` without a lease is waiting: `resume_after` is the next observation. `GET /operator/tasks/:id` lists each work unit's pull request, delivery state, outcome, and the last required-check and review observation.
+- A delivery `BLOCKED` task names the repository and reason in `last_error`. Fix the cause on GitHub, for example rerun a failed check, reopen a closed pull request, restore a force-pushed branch, or configure required checks, then retry the task. Retrying re-verifies every stage without calling an agent and reuses the recorded push, pull request, and Linear updates. A pull request closed on purpose, or a task that should not be delivered, is cancelled instead.
+- Disabling `deliver` leaves tasks already in delivery states unclaimed until it is enabled again.
 - For an agent stage that blocked or failed, `GET /operator/tasks/:id` lists attempts with `failureCategory` (`invalid-output`, `needs-clarification`, `diff-rejected`, `workspace-integrity`, `quality-failed`, `quality-infrastructure`, `review-rejected`, and others) and redacted evidence. Fix the contract or configuration, then retry the task; accepted plans and commits are reused.
 - A `workspace-integrity` failure means an agent changed Git state (committed, switched branch, or rewrote the worktree's `.git` file). Inspect the worktree before retrying; the orchestrator does not repair it.
 - Database operations require a reachable PostgreSQL `DATABASE_URL` and applied migrations.

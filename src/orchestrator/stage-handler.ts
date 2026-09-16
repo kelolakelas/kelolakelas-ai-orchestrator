@@ -12,12 +12,17 @@ export type StageOutcome =
     reason?: string;
     /** Consumes one bounded attempt atomically with the transition. */
     incrementCounter?: AttemptCounter;
-    /** Operator-visible explanation persisted as `last_error`. */
-    lastError?: string;
+    /** Operator-visible explanation persisted as `last_error`; `null` clears an earlier one. */
+    lastError?: string | null;
     /** Stops automatic processing; use with `BLOCKED`. */
     requiresManualIntervention?: boolean;
   }
   | { kind: 'pause-limit'; pauseReason: Exclude<PauseReason, 'OPERATING_HOURS_ENDED'>; resumeAfter?: Date; reason?: string }
+  /**
+   * Keeps the current state and releases the lease until `until`, for example while required checks are pending or a
+   * provider is briefly unavailable. No transition is recorded because the state does not change.
+   */
+  | { kind: 'wait'; until: Date; reason: string; lastError?: string | null }
   /** The handler observed `signal.aborted`, recorded any checkpoint it needs, and stopped at a safe point. */
   | { kind: 'interrupted' };
 

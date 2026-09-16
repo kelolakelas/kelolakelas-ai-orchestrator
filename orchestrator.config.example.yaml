@@ -15,6 +15,12 @@ orchestrator:
     # Phase 5: analyze, implement, run quality gates, fix, and review in those worktrees, then park a reviewed local
     # branch. Requires `prepareWorkspaces`, `agents`, and `quality.checks` for every repository. Never pushes.
     runAgents: false
+    # Phase 6: push reviewed branches, open one pull request per repository, observe required checks, reviews, and
+    # merges, and synchronize Linear. Requires `runAgents`, `delivery`, and GITHUB_TOKEN. Never merges. Read the README's
+    # delivery trust boundary before enabling it in production.
+    deliver: false
+  # Delivery states (PR_CREATED, WAITING_CI, READY_FOR_HUMAN_REVIEW) use their own claim limit.
+  maxConcurrentDeliveryTasks: 2
 schedule:
   enabled: true
   allowMechanicalOperationsOutsideHours: true
@@ -105,3 +111,12 @@ limits:
 #     maxUnplannedFiles: 10
 #     # forbiddenPaths, generatedPaths, and allowedBinaryPaths have safe defaults; see README.
 #   maxReviewDiffBytes: 200000
+# Required when deliver is true.
+# delivery:
+#   github: { apiUrl: https://api.github.com, requestTimeoutMs: 15000, maxRetries: 3 }
+#   pollIntervalSeconds: 120
+#   retryIntervalSeconds: 300
+#   # A required check still missing or pending this long after the pull request head appeared blocks the task.
+#   requiredChecksTimeoutMinutes: 180
+#   draftPullRequests: false
+#   linearComments: true
