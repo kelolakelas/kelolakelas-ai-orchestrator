@@ -19,9 +19,11 @@ Implemented:
 
 Phase 2 adds read-only Linear intake. Phase 3 adds the long-running scheduler: a lease-based claim loop with a database-wide concurrency limit, operating-hours gates at stage boundaries, persisted pause/resume, lease heartbeats and stale-lease recovery, graceful shutdown, liveness/readiness/status endpoints, and audited operator controls.
 
-Not yet implemented: stage handlers (repository worktrees, quality gates, AI runners), GitHub delivery, PR creation, and CI polling.
+Phase 4 adds isolated repository preparation: a trusted repository registry, deterministic per-task Git worktrees from the current remote base branch, repository locking, ownership markers, restart reuse, and release of clean worktrees after terminal outcomes.
 
-Consequently, the running service continuously audits Linear intake, persists eligible tasks, recovers expired leases, and applies operator controls, but it registers no stage handlers and therefore claims no task. Execution starts when Phases 4 and 5 register handlers.
+Not yet implemented: AI runners, quality gates, GitHub delivery, PR creation, and CI polling.
+
+Consequently, by default the running service audits Linear intake, persists eligible tasks, recovers expired leases, and applies operator controls, but claims no task. With `orchestrator.execution.prepareWorkspaces: true` it claims tasks, prepares their worktrees, and parks them in `BLOCKED` until the Phase 5 analyzer exists. It never invokes an AI runner, commits, or pushes.
 
 ## Architecture
 
@@ -75,6 +77,9 @@ npm run dev
 - `orchestrator.shutdownGracePeriodSeconds`, how long `SIGTERM`/`SIGINT` waits for running stages to park
 - `orchestrator.usageLimitPauseMinutes`, the default wait before resuming a usage-limit pause
 - `orchestrator.http.host` and `orchestrator.http.port` for health, status, and operator endpoints (default `127.0.0.1:8089`)
+- `orchestrator.execution.prepareWorkspaces` registers the workspace preparation stage (default `false`)
+- `workspace.root`, `minimumFreeDiskMb`, `gitTimeoutSeconds`, `repositoryLockTimeoutSeconds`, and `remoteRetryMinutes`
+- `repositories.<name>` for each contract repository (`web`, `api-gateway`, `academic`, `identity`, `billing`): absolute local clone `path`, `github` as `owner/name`, `remote` (default `origin`), and `baseBranch` (default `main`)
 - model tier identifiers under `models.tiers`; application code never accepts arbitrary model IDs from model output
 - Linear filters and retry limits
 
@@ -136,6 +141,30 @@ A claimed task runs stage by stage through `StageHandler` implementations. The l
 
 AI stages (analysis, implementation, fix, review) need an open window with enough remaining time. Mechanical stages (testing, delivery, CI observation) may run outside hours when `allowMechanicalOperationsOutsideHours` is true. With `finishCurrentStep: false`, a running AI stage is interrupted when its window closes.
 
+## Repository preparation
+
+When `prepareWorkspaces` is enabled, the `ANALYZING` stage prepares one worktree per repository declared by the validated contract, then parks the task in `BLOCKED` with the reason `Workspaces prepared; no analyzer stage is registered`. An operator retry after Phase 5 is deployed reuses the same worktrees.
+
+For each repository, under a PostgreSQL advisory lock named for that repository:
+
+1. The registry resolves the repository. Registry paths are canonicalized at startup and must not overlap each other or the workspace root. Repositories absent from the registry or the contract cannot be opened.
+2. The local clone must be a Git top level whose configured remote URL points at the registered GitHub repository. `url.<base>.insteadOf` rewrites are trusted host configuration.
+3. The branch is the Linear `branchName` from the hydrated contract, validated with `git check-ref-format`. The worktree path is `<workspace.root>/<taskId>/<repository>`.
+4. An existing valid worktree is reused without fetching or moving its base. It must be locked by the orchestrator, carry matching ownership markers, and descend from its recorded base commit. This includes a worktree created before a crash prevented the database write.
+5. Otherwise the worker requires that the branch does not exist on the remote, fetches the base branch, fast-forwards local `main` when that is safe, checks free disk space, writes ownership markers, and runs `git worktree add --lock` at the fetched commit. The new worktree must be a clean checkout of that commit inside the root.
+6. The workspace path, branch, and base commit are persisted on the work unit while the lease is held. Unique indexes prevent two work units from recording the same repository branch or workspace path.
+
+Ownership markers are branch config values in the clone (`branch.<name>.orchestratortask`, `orchestratorbase`, `orchestratorworktree`) plus the worktree lock reason `kelolakelas-ai-orchestrator task=<id> repository=<name>`.
+
+Outcomes:
+
+- **Unreachable remote:** `PAUSED_LIMIT` with `REMOTE_UNAVAILABLE`, resumed after `remoteRetryMinutes`.
+- **Unmerged dependency, user-owned or foreign branch, unexpected path, missing persisted worktree, rewritten history, remote branch already present, wrong remote, or insufficient disk:** `BLOCKED` for manual intervention with the reason in `last_error`. Stacked PRs are not expressible in the planning contract, so an unmerged dependency always blocks.
+
+Git runs as a fixed executable with argument arrays, repository hooks disabled (`core.hooksPath=/dev/null`), a timeout, bounded output, and an environment limited to `PATH`, `HOME`, `USER`, `LOGNAME`, `SSH_AUTH_SOCK`, `XDG_CONFIG_HOME`, and `TMPDIR`. Provider tokens and `DATABASE_URL` are never passed to Git.
+
+Every tick, workspaces of `COMPLETED` and `CANCELLED` tasks are released. A worktree is removed only when it is registered at the orchestrator path, locked by the orchestrator for that task, marked for that task, and has no uncommitted or untracked files; removal never uses `--force`. Branches and their commits are kept. A worktree that cannot be released keeps `workspace_cleanup_blocked_reason` on its work unit and is retried on later ticks.
+
 ## Pause and resume behavior
 
 A schedule or usage-limit pause requires a `resumeState` that the paused state can legally resume to. Pausing releases the lease. A limit pause resumes only after its `resume_after` time and when the schedule gate for its `resumeState` is open. A schedule pause resumes only when the gate for its `resumeState` opens. Stage handlers must be idempotent with respect to their checkpoints, because a resumed or parked stage runs again.
@@ -189,6 +218,8 @@ Secrets belong only in the environment file or service manager secret mechanism.
 - Config errors fail startup with Zod validation details. Check time format (`HH:mm`), IANA timezone names, and required model tiers.
 - If no work starts, check `GET /status` for `pauseNewWork` and `scheduleOverride`, the current local time in the configured timezone, the minimum remaining-time guards, and whether a stage handler exists for the task's stage.
 - If `/readyz` fails, its `checks` object names the unavailable dependency: `database`, `linear`, or `scheduler`.
+- A task `BLOCKED` during preparation names the conflict in `last_error`. Resolve it in the local clone (for example remove a stale branch you own, or push the dependency), then retry the task. Never delete a worktree carrying the orchestrator lock reason while its task is active.
+- A work unit with `workspace_cleanup_blocked_reason` still has its worktree. Commit, move, or discard the listed changes; the next tick retries the release.
 - A `BLOCKED` task with `requires_manual_intervention` was recovered from an expired lease, failed a stage, or was flagged by an operator. Inspect `GET /operator/tasks/:id` and its audit history, then retry or cancel it.
 - If a task is paused, inspect its persisted `resume_state`, `pause_reason`, and attempt counters before resuming it.
 - Database operations require a reachable PostgreSQL `DATABASE_URL` and applied migrations.

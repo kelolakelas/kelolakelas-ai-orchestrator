@@ -5,6 +5,7 @@ import * as schema from '../src/db/schema.js';
 import { persistLinearIntake, type IntakeReport } from '../src/intake/linear-discovery.js';
 import { validatePlanningIssue } from '../src/intake/planning-contract.js';
 import { TaskRepository } from '../src/repositories/task.repository.js';
+import { resetDatabase } from './support/database.js';
 
 const databaseUrl = process.env.MIGRATION_TEST_DATABASE_URL;
 const describeIntegration = databaseUrl === undefined ? describe.skip : describe;
@@ -22,7 +23,7 @@ describeIntegration('Linear intake persistence', () => {
     const pool = new pg.Pool({ connectionString: databaseUrl });
     const repository = new TaskRepository(drizzle(pool, { schema }));
     try {
-      await pool.query('TRUNCATE tasks, intake_quarantines CASCADE');
+      await resetDatabase(pool);
       const blocker = issue('blocker-task', '1');
       const dependent = issue('dependent-task', '2', ['blocker-task']);
       const report: IntakeReport = { eligible: [blocker, dependent], quarantined: [{ id: 'bad-1', identifier: 'KEL-BAD', reason: 'Missing contract', payload: { description: 'invalid' } }], ignored: [] };
@@ -38,7 +39,7 @@ describeIntegration('Linear intake persistence', () => {
       const quarantines = await pool.query<{ linear_issue_id: string }>('SELECT linear_issue_id FROM intake_quarantines ORDER BY linear_issue_id');
       expect(quarantines.rows).toEqual([{ linear_issue_id: '1' }, { linear_issue_id: 'bad-1' }]);
     } finally {
-      await pool.query('TRUNCATE tasks, intake_quarantines CASCADE');
+      await resetDatabase(pool);
       await pool.end();
     }
   });

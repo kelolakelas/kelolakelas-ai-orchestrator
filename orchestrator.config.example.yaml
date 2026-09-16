@@ -9,6 +9,9 @@ orchestrator:
   http:
     host: 127.0.0.1
     port: 8089
+  execution:
+    # Phase 4: prepare isolated worktrees for claimed tasks. Requires `workspace` and `repositories`.
+    prepareWorkspaces: false
 schedule:
   enabled: true
   allowMechanicalOperationsOutsideHours: true
@@ -44,3 +47,16 @@ limits:
   maxImplementationAttempts: 4
   maxQualityFixAttempts: 3
   maxReviewCycles: 3
+# Optional until prepareWorkspaces is enabled. Workspace releases for terminal tasks run whenever `workspace` is set.
+# workspace:
+#   root: /var/lib/ai-orchestrator/workspaces
+#   minimumFreeDiskMb: 2048
+#   gitTimeoutSeconds: 300
+#   repositoryLockTimeoutSeconds: 600
+#   remoteRetryMinutes: 5
+# repositories:
+#   web: { path: /srv/kelolakelas/kelolakelas-web, github: kelolakelas/kelolakelas-web, remote: origin, baseBranch: main }
+#   api-gateway: { path: /srv/kelolakelas/kelolakelas-api-gateway, github: kelolakelas/kelolakelas-api-gateway }
+#   academic: { path: /srv/kelolakelas/kelolakelas-academic-service, github: kelolakelas/kelolakelas-academic-service }
+#   identity: { path: /srv/kelolakelas/kelolakelas-identity-service, github: kelolakelas/kelolakelas-identity-service }
+#   billing: { path: /srv/kelolakelas/kelolakelas-billing-service, github: kelolakelas/kelolakelas-billing-service }

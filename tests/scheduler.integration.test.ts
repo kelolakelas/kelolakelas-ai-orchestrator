@@ -7,6 +7,7 @@ import type { StageHandlers } from '../src/orchestrator/stage-handler.js';
 import { OperatorRepository } from '../src/repositories/operator.repository.js';
 import { TaskRepository } from '../src/repositories/task.repository.js';
 import { insideHours, outsideHours, testConfig } from './support/config.js';
+import { resetDatabase } from './support/database.js';
 
 const databaseUrl = process.env.MIGRATION_TEST_DATABASE_URL;
 const describeIntegration = databaseUrl === undefined ? describe.skip : describe;
@@ -30,22 +31,12 @@ describeIntegration('scheduler with PostgreSQL', () => {
     operator = new OperatorRepository(db);
   });
 
-  // DELETE rather than TRUNCATE: TRUNCATE fsyncs new relation files per table, which can exceed hook timeouts on a busy disk.
-  async function reset(): Promise<void> {
-    await pool.query(`
-      DELETE FROM operator_actions; DELETE FROM state_transitions; DELETE FROM task_checkpoints; DELETE FROM task_attempts;
-      DELETE FROM external_operations; DELETE FROM task_dependencies; DELETE FROM task_work_units; DELETE FROM tasks;
-      DELETE FROM intake_quarantines;
-      UPDATE orchestrator_controls SET pause_new_work = false, schedule_override = 'normal';
-    `);
-  }
-
   afterAll(async () => {
-    await reset();
+    await resetDatabase(pool);
     await pool.end();
   });
 
-  beforeEach(reset);
+  beforeEach(() => resetDatabase(pool));
 
   async function createQueued(count: number): Promise<string[]> {
     const ids: string[] = [];

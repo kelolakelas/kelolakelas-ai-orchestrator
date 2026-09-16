@@ -16,7 +16,8 @@ async function resetDatabase(client: Client): Promise<void> {
   await client.query('DROP SCHEMA IF EXISTS drizzle CASCADE; DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;');
 }
 
-describeMigration('database migrations', () => {
+// Schema resets and DDL fsync heavily; allow for slow disks rather than the 5 second default.
+describeMigration('database migrations', { timeout: 60_000 }, () => {
   it('preserves a Phase 1 task through every migration including Phase 3 controls', async () => {
     const client = new Client({ connectionString: migrationDatabaseUrl });
     await client.connect();
@@ -38,6 +39,7 @@ describeMigration('database migrations', () => {
 
       await applyMigration(client, '0003_true_grey_gargoyle.sql');
       await applyMigration(client, '0004_phase3_scheduler_controls.sql');
+      await applyMigration(client, '0005_phase4_workspace_identity.sql');
       const upgraded = await client.query<{ complexity: string; resume_after: Date | null; cancel_requested_at: Date | null }>(
         'SELECT complexity, resume_after, cancel_requested_at FROM tasks WHERE linear_issue_id = $1',
         ['issue-1'],
@@ -49,6 +51,12 @@ describeMigration('database migrations', () => {
       expect(controls.rows).toEqual([{ id: 'global', pause_new_work: false, schedule_override: 'normal' }]);
       const states = await client.query<{ states: string }>("SELECT enum_range(NULL::task_state)::text AS states");
       expect(states.rows[0]?.states).toContain('CANCELLED');
+      const workspaceIndexes = await client.query<{ indexname: string }>(
+        "SELECT indexname FROM pg_indexes WHERE tablename = 'task_work_units' AND indexname LIKE 'task_work_units_%_unique' ORDER BY indexname",
+      );
+      expect(workspaceIndexes.rows.map((row) => row.indexname)).toEqual([
+        'task_work_units_repository_branch_unique', 'task_work_units_task_repository_unique', 'task_work_units_workspace_path_unique',
+      ]);
     } finally {
       await resetDatabase(client);
       await client.end();

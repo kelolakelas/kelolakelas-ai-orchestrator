@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "test": "vitest run --exclude tests/**/*.integration.test.ts",
     "test:migrations": "vitest run tests/migrations.integration.test.ts",
-    "test:repository": "vitest run --no-file-parallelism tests/task.repository.integration.test.ts tests/linear-intake.integration.test.ts tests/scheduler.integration.test.ts",
+    "test:repository": "vitest run --no-file-parallelism tests/task.repository.integration.test.ts tests/linear-intake.integration.test.ts tests/scheduler.integration.test.ts tests/workspace.integration.test.ts",
     "test:watch": "vitest",
     "intake:validate": "tsx src/intake/validate.ts",
     "db:generate": "drizzle-kit generate",

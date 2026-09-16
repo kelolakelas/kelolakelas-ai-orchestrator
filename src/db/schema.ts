@@ -73,10 +73,14 @@ export const taskWorkUnits = pgTable('task_work_units', {
   workspacePath: text('workspace_path'),
   branch: text('branch'),
   baseCommit: text('base_commit'),
+  workspaceReleasedAt: timestamp('workspace_released_at', { withTimezone: true }),
+  workspaceCleanupBlockedReason: text('workspace_cleanup_blocked_reason'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex('task_work_units_task_repository_unique').on(table.taskId, table.repository),
+  uniqueIndex('task_work_units_repository_branch_unique').on(table.repository, table.branch),
+  uniqueIndex('task_work_units_workspace_path_unique').on(table.workspacePath),
 ]);
 
 export const taskAttempts = pgTable('task_attempts', {
