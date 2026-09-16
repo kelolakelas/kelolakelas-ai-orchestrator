@@ -14,6 +14,7 @@ export const taskStates = [
   'BLOCKED',
   'FAILED',
   'COMPLETED',
+  'CANCELLED',
 ] as const;
 
 export type TaskState = (typeof taskStates)[number];
@@ -26,8 +27,14 @@ export type OperationType =
   | 'IMPLEMENTATION'
   | 'FIX'
   | 'REVIEW'
+  | 'QUALITY_GATE'
   | 'DELIVERY'
   | 'CI_CHECK';
+
+export type ScheduleOverride = 'normal' | 'enabled' | 'disabled';
+
+/** States that carry no further work and never hold a lease. */
+export const terminalStates: readonly TaskState[] = ['COMPLETED', 'CANCELLED'];
 
 export interface TaskRecord {
   id: string;
@@ -43,7 +50,7 @@ export interface TaskRecord {
 
 export const transitionMap: Readonly<Record<TaskState, readonly TaskState[]>> = {
   QUEUED: ['ANALYZING', 'BLOCKED'],
-  ANALYZING: ['READY', 'BLOCKED', 'PAUSED_SCHEDULE'],
+  ANALYZING: ['READY', 'BLOCKED', 'PAUSED_LIMIT', 'PAUSED_SCHEDULE'],
   READY: ['IMPLEMENTING', 'BLOCKED', 'PAUSED_SCHEDULE'],
   IMPLEMENTING: ['TESTING', 'FIXING', 'PAUSED_LIMIT', 'PAUSED_SCHEDULE', 'BLOCKED', 'FAILED'],
   TESTING: ['REVIEWING', 'FIXING', 'PAUSED_SCHEDULE', 'BLOCKED', 'FAILED'],
@@ -53,8 +60,14 @@ export const transitionMap: Readonly<Record<TaskState, readonly TaskState[]>> = 
   WAITING_CI: ['READY_FOR_HUMAN_REVIEW', 'BLOCKED'],
   READY_FOR_HUMAN_REVIEW: ['COMPLETED'],
   PAUSED_SCHEDULE: ['ANALYZING', 'READY', 'IMPLEMENTING', 'TESTING', 'FIXING', 'REVIEWING', 'BLOCKED'],
-  PAUSED_LIMIT: ['IMPLEMENTING', 'FIXING', 'REVIEWING', 'BLOCKED'],
+  PAUSED_LIMIT: ['ANALYZING', 'IMPLEMENTING', 'FIXING', 'REVIEWING', 'BLOCKED'],
   BLOCKED: ['QUEUED'],
   FAILED: ['QUEUED', 'BLOCKED'],
   COMPLETED: [],
+  CANCELLED: [],
 };
+
+/** Operator cancellation is permitted from every non-terminal state. */
+export function canCancel(state: TaskState): boolean {
+  return !terminalStates.includes(state);
+}

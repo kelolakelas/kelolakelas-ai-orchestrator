@@ -1,5 +1,5 @@
 import type { PauseReason, TaskState } from '../types/domain.js';
-import { transitionMap } from '../types/domain.js';
+import { canCancel, transitionMap } from '../types/domain.js';
 
 export class InvalidTransitionError extends Error {
   constructor(public readonly from: TaskState, public readonly to: TaskState) {
@@ -17,7 +17,7 @@ export interface StateTransition {
 }
 
 export function canTransition(from: TaskState, to: TaskState): boolean {
-  return transitionMap[from].includes(to);
+  return transitionMap[from].includes(to) || (to === 'CANCELLED' && canCancel(from));
 }
 
 export function transitionTask(
@@ -35,6 +35,10 @@ export function transitionTask(
 
   if (next === 'PAUSED_LIMIT' && !details.resumeState) {
     throw new Error('PAUSED_LIMIT transitions require resumeState');
+  }
+
+  if ((next === 'PAUSED_SCHEDULE' || next === 'PAUSED_LIMIT') && details.resumeState && !canTransition(next, details.resumeState)) {
+    throw new Error(`${next} cannot resume to ${details.resumeState}`);
   }
 
   return { from: current, to: next, ...details };

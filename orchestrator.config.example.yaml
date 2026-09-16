@@ -2,6 +2,13 @@ timezone: Asia/Jakarta
 orchestrator:
   maxConcurrentTasks: 1
   pollingIntervalSeconds: 60
+  leaseDurationSeconds: 300
+  heartbeatIntervalSeconds: 60
+  shutdownGracePeriodSeconds: 30
+  usageLimitPauseMinutes: 30
+  http:
+    host: 127.0.0.1
+    port: 8089
 schedule:
   enabled: true
   allowMechanicalOperationsOutsideHours: true
@@ -23,6 +30,9 @@ linear:
   teamKey: KEL
   requiredLabels: [ai-ready]
   excludedLabels: [human-only, blocked]
+  apiUrl: https://api.linear.app/graphql
+  requestTimeoutMs: 10000
+  maxRetries: 3
 models:
   analyzer: { tier: terra, effort: high }
   reviewer: { tier: terra, effort: high }
