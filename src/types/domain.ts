@@ -33,6 +33,9 @@ export type OperationType =
 
 export type ScheduleOverride = 'normal' | 'enabled' | 'disabled';
 
+/** Per-task bounded retry counters, each incremented atomically with the transition that consumes an attempt. */
+export type AttemptCounter = 'implementationAttempts' | 'qualityFixAttempts' | 'reviewAttempts';
+
 /** States that carry no further work and never hold a lease. */
 export const terminalStates: readonly TaskState[] = ['COMPLETED', 'CANCELLED'];
 
@@ -52,7 +55,8 @@ export const transitionMap: Readonly<Record<TaskState, readonly TaskState[]>> = 
   QUEUED: ['ANALYZING', 'BLOCKED'],
   ANALYZING: ['READY', 'BLOCKED', 'PAUSED_LIMIT', 'PAUSED_SCHEDULE'],
   READY: ['IMPLEMENTING', 'BLOCKED', 'PAUSED_SCHEDULE'],
-  IMPLEMENTING: ['TESTING', 'FIXING', 'PAUSED_LIMIT', 'PAUSED_SCHEDULE', 'BLOCKED', 'FAILED'],
+  // IMPLEMENTING -> READY retries a rejected implementation attempt through the schedule gate with an escalated model.
+  IMPLEMENTING: ['TESTING', 'READY', 'FIXING', 'PAUSED_LIMIT', 'PAUSED_SCHEDULE', 'BLOCKED', 'FAILED'],
   TESTING: ['REVIEWING', 'FIXING', 'PAUSED_SCHEDULE', 'BLOCKED', 'FAILED'],
   FIXING: ['TESTING', 'PAUSED_LIMIT', 'PAUSED_SCHEDULE', 'BLOCKED', 'FAILED'],
   REVIEWING: ['PR_CREATED', 'FIXING', 'PAUSED_LIMIT', 'PAUSED_SCHEDULE', 'BLOCKED', 'FAILED'],

@@ -212,3 +212,54 @@ describe('workspace manager', { timeout: 30_000 }, () => {
     await expect(RepositoryRegistry.load({ ...config, workspace: { ...config.workspace!, root: link } })).rejects.toThrow(/overlap the workspace root/);
   });
 });
+
+describe('task workspace verification, restore, and commit', () => {
+  async function prepared() {
+    const context = await setup();
+    const workspace = await context.manager.prepare({ taskId: taskA, repository: 'web', branch, persisted: noPersisted });
+    return { ...context, identity: { taskId: taskA, repository: 'web' as const, workspacePath: workspace.workspacePath, branch, baseCommit: workspace.baseCommit } };
+  }
+
+  it('commits agent changes with the orchestrator identity and discards uncommitted output', async () => {
+    const { manager, identity } = await prepared();
+    expect(await manager.verifyTaskWorkspace(identity)).toEqual({ head: identity.baseCommit });
+
+    writeFileSync(join(identity.workspacePath, 'feature.txt'), 'ready\n');
+    const { commit, parent } = await manager.commitWorkspace(identity, 'KEL-1: implement\n\nOrchestrator-Task: x', { name: 'Orchestrator', email: 'bot@example.test' });
+    expect(parent).toBe(identity.baseCommit);
+    expect(git(identity.workspacePath, 'log', '-1', '--format=%H %an <%ae> %s')).toBe(`${commit} Orchestrator <bot@example.test> KEL-1: implement`);
+    expect(await manager.verifyTaskWorkspace(identity)).toEqual({ head: commit });
+
+    writeFileSync(join(identity.workspacePath, 'feature.txt'), 'partial');
+    mkdirSync(join(identity.workspacePath, 'scratch'));
+    writeFileSync(join(identity.workspacePath, 'scratch', 'notes.txt'), 'partial');
+    expect(await manager.restoreWorkspace(identity)).toEqual({ head: commit, discarded: true });
+    expect(git(identity.workspacePath, 'status', '--porcelain', '--untracked-files=all')).toBe('');
+    expect(await manager.restoreWorkspace(identity)).toEqual({ head: commit, discarded: false });
+  });
+
+  it('refuses a worktree whose Git pointer, branch, or history an agent changed', async () => {
+    const { fixture, manager, identity } = await prepared();
+
+    // An agent can write the worktree's .git file; pointing it at another repository must not be trusted.
+    const pointer = join(identity.workspacePath, '.git');
+    const original = git(identity.workspacePath, 'rev-parse', '--git-dir');
+    writeFileSync(pointer, `gitdir: ${join(fixture.clone('academic'), '.git')}\n`);
+    await expect(manager.verifyTaskWorkspace(identity)).rejects.toThrow(WorkspaceBlockedError);
+    await expect(manager.restoreWorkspace(identity)).rejects.toThrow(/no longer points to the web repository|is not on branch/);
+    writeFileSync(pointer, `gitdir: ${original}\n`);
+    await manager.verifyTaskWorkspace(identity);
+
+    git(identity.workspacePath, 'checkout', '-q', '-b', 'agent-branch');
+    await expect(manager.verifyTaskWorkspace(identity)).rejects.toThrow(/not on branch|not locked by the orchestrator/);
+    git(identity.workspacePath, 'checkout', '-q', branch);
+
+    git(identity.workspacePath, 'checkout', '-q', '--orphan', 'orphan');
+    git(identity.workspacePath, 'commit', '-q', '--allow-empty', '-m', 'rewrite');
+    git(identity.workspacePath, 'branch', '-q', '-f', branch, 'HEAD');
+    git(identity.workspacePath, 'checkout', '-q', branch);
+    await expect(manager.verifyTaskWorkspace(identity)).rejects.toThrow(/no longer descends from base/);
+
+    await expect(manager.verifyTaskWorkspace({ ...identity, taskId: taskB })).rejects.toThrow(WorkspaceBlockedError);
+  });
+});

@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { mkdir, realpath, rmdir, statfs } from 'node:fs/promises';
+import { join } from 'node:path';
 import { GitCommandError, githubRepositoryFromUrl, parseWorktreeList, type GitRunner, type WorktreeEntry } from './git.js';
 import type { RepositoryLock } from './repository-lock.js';
 import { isInside, WorkspaceBlockedError, type RegisteredRepository, type RepositoryName, type RepositoryRegistry } from './repository-registry.js';
@@ -41,6 +42,16 @@ export interface ReleaseWorkspaceInput {
 }
 
 export type ReleaseResult = { released: true } | { released: false; reason: string };
+
+/** A persisted work-unit workspace that a later stage operates on. */
+export interface TaskWorkspace extends WorkspaceIdentity {
+  taskId: string;
+}
+
+export interface CommitAuthor {
+  name: string;
+  email: string;
+}
 
 interface OwnershipMarker {
   task: string | null;
@@ -134,6 +145,87 @@ export class WorkspaceManager {
       await this.verifyFreshWorktree(workspacePath, baseCommit);
       return { repository: repository.name, workspacePath, branch, baseCommit, reused: false, localBaseUpdated };
     });
+  }
+
+  /**
+   * Proves that a persisted workspace is still the orchestrator-owned worktree of this task and returns its HEAD. An
+   * agent can write inside a worktree, including its `.git` pointer file, so the Git directory, checked-out branch,
+   * ownership markers, lock reason, and ancestry are all re-verified before the orchestrator trusts or mutates it.
+   */
+  async verifyTaskWorkspace(workspace: TaskWorkspace): Promise<{ head: string }> {
+    const repository = this.registry.get(workspace.repository);
+    return this.lock.withLock(repository.name, () => this.verifyOwnedWorkspace(repository, workspace));
+  }
+
+  /** Discards uncommitted and untracked (not ignored) changes, returning the worktree to its verified HEAD. */
+  async restoreWorkspace(workspace: TaskWorkspace): Promise<{ head: string; discarded: boolean }> {
+    const repository = this.registry.get(workspace.repository);
+    return this.lock.withLock(repository.name, async () => {
+      const { head } = await this.verifyOwnedWorkspace(repository, workspace);
+      const cwd = { cwd: workspace.workspacePath };
+      const status = await this.git.output(['status', '--porcelain=v1', '--untracked-files=all'], cwd);
+      if (status === '') return { head, discarded: false };
+      await this.git.run(['reset', '--quiet', '--hard', head], cwd);
+      await this.git.run(['clean', '--quiet', '--force', '-d'], cwd);
+      return { head, discarded: true };
+    });
+  }
+
+  /**
+   * Commits every staged and unstaged change on the task branch with a fixed orchestrator identity. Hooks are disabled
+   * by the Git runner. The new commit must be a direct child of the verified HEAD.
+   */
+  async commitWorkspace(workspace: TaskWorkspace, message: string, author: CommitAuthor): Promise<{ commit: string; parent: string }> {
+    const repository = this.registry.get(workspace.repository);
+    return this.lock.withLock(repository.name, async () => {
+      const { head } = await this.verifyOwnedWorkspace(repository, workspace);
+      const cwd = { cwd: workspace.workspacePath };
+      await this.git.run(['add', '--all'], cwd);
+      await this.git.run([
+        '-c', `user.name=${author.name}`, '-c', `user.email=${author.email}`, '-c', 'commit.gpgsign=false',
+        'commit', '--quiet', '--no-verify', '--allow-empty-message', '--cleanup=verbatim', '-m', message,
+      ], cwd);
+      const commit = await this.git.output(['rev-parse', 'HEAD'], cwd);
+      const parent = await this.git.output(['rev-parse', 'HEAD^'], cwd);
+      if (parent !== head) throw new WorkspaceBlockedError(`Commit in ${repository.name} is not a child of the verified HEAD ${head}`);
+      return { commit, parent };
+    });
+  }
+
+  private async verifyOwnedWorkspace(repository: RegisteredRepository, workspace: TaskWorkspace): Promise<{ head: string }> {
+    const expectedPath = this.registry.worktreePath(workspace.taskId, repository.name);
+    if (workspace.workspacePath !== expectedPath) {
+      throw new WorkspaceBlockedError(`Workspace path ${workspace.workspacePath} is not the orchestrator path ${expectedPath}`);
+    }
+    // Resolved from the clone, which agents cannot write, rather than from the worktree.
+    const worktree = (await this.listWorktrees(repository)).find((entry) => entry.path === expectedPath);
+    if (!worktree) throw new WorkspaceBlockedError(`Workspace for ${repository.name} is missing at ${expectedPath}; manual recovery required`);
+    const marker = await this.readMarker(repository, workspace.branch);
+    if (marker.task !== workspace.taskId) throw new WorkspaceBlockedError(`Branch ${workspace.branch} in ${repository.name} is not owned by task ${workspace.taskId}`);
+    const input: PrepareWorkspaceInput = {
+      taskId: workspace.taskId,
+      repository: repository.name,
+      branch: workspace.branch,
+      persisted: { workspacePath: workspace.workspacePath, branch: workspace.branch, baseCommit: workspace.baseCommit },
+    };
+    await this.verifyReusableWorktree(repository, worktree, input, { workspacePath: expectedPath, branch: workspace.branch, marker, reason: worktreeLockReason(workspace.taskId, repository.name) });
+
+    const cwd = { cwd: expectedPath };
+    const commonDirectory = await this.git.run(['rev-parse', '--path-format=absolute', '--git-common-dir'], { ...cwd, allowFailure: true });
+    const expectedCommonDirectory = await realpath(join(repository.path, '.git')).catch(() => null);
+    const actualCommonDirectory = commonDirectory.exitCode === 0 ? await realpath(commonDirectory.stdout.trim()).catch(() => null) : null;
+    if (actualCommonDirectory === null || actualCommonDirectory !== expectedCommonDirectory) {
+      throw new WorkspaceBlockedError(`Worktree ${expectedPath} no longer points to the ${repository.name} repository`);
+    }
+    const symbolic = await this.git.run(['symbolic-ref', '--quiet', 'HEAD'], { ...cwd, allowFailure: true });
+    if (symbolic.exitCode !== 0 || symbolic.stdout.trim() !== `refs/heads/${workspace.branch}`) {
+      throw new WorkspaceBlockedError(`Worktree ${expectedPath} is not on branch ${workspace.branch}`);
+    }
+    const head = await this.revParse(repository, 'HEAD', expectedPath);
+    if (head === null || head !== await this.revParse(repository, `refs/heads/${workspace.branch}`)) {
+      throw new WorkspaceBlockedError(`Worktree HEAD in ${repository.name} does not match branch ${workspace.branch}`);
+    }
+    return { head };
   }
 
   /** Removes an orchestrator-owned, clean worktree. The branch and its commits are always kept. */

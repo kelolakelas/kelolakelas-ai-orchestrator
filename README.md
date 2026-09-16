@@ -21,9 +21,11 @@ Phase 2 adds read-only Linear intake. Phase 3 adds the long-running scheduler: a
 
 Phase 4 adds isolated repository preparation: a trusted repository registry, deterministic per-task Git worktrees from the current remote base branch, repository locking, ownership markers, restart reuse, and release of clean worktrees after terminal outcomes.
 
-Not yet implemented: AI runners, quality gates, GitHub delivery, PR creation, and CI polling.
+Phase 5 adds supervised agent execution: a structured analyzer, a write-enabled implementer, trusted repository quality gates, bounded fix cycles, and a structured reviewer, with a diff policy and Git ownership checks before every local commit.
 
-Consequently, by default the running service audits Linear intake, persists eligible tasks, recovers expired leases, and applies operator controls, but claims no task. With `orchestrator.execution.prepareWorkspaces: true` it claims tasks, prepares their worktrees, and parks them in `BLOCKED` until the Phase 5 analyzer exists. It never invokes an AI runner, commits, or pushes.
+Not yet implemented: push, GitHub pull requests, CI polling, merge observation, and Linear status updates.
+
+Consequently, by default the running service audits Linear intake, persists eligible tasks, recovers expired leases, and applies operator controls, but claims no task. With `orchestrator.execution.prepareWorkspaces: true` it claims tasks, prepares their worktrees, and parks them in `BLOCKED`. With `runAgents: true` as well, it analyzes, implements, tests, fixes, and reviews each task, then parks a reviewed local branch in `BLOCKED`. It never pushes, opens a pull request, or merges.
 
 ## Architecture
 
@@ -78,8 +80,12 @@ npm run dev
 - `orchestrator.usageLimitPauseMinutes`, the default wait before resuming a usage-limit pause
 - `orchestrator.http.host` and `orchestrator.http.port` for health, status, and operator endpoints (default `127.0.0.1:8089`)
 - `orchestrator.execution.prepareWorkspaces` registers the workspace preparation stage (default `false`)
+- `orchestrator.execution.runAgents` registers the Phase 5 agent stages (default `false`); requires `prepareWorkspaces`, `agents`, every routed model tier (`luna`, `terra`, `sol`), and quality checks for every repository
 - `workspace.root`, `minimumFreeDiskMb`, `gitTimeoutSeconds`, `repositoryLockTimeoutSeconds`, and `remoteRetryMinutes`
 - `repositories.<name>` for each contract repository (`web`, `api-gateway`, `academic`, `identity`, `billing`): absolute local clone `path`, `github` as `owner/name`, `remote` (default `origin`), and `baseBranch` (default `main`)
+- `repositories.<name>.quality`: ordered `setup` and `checks` commands (`name`, argument array `command`, `timeoutSeconds`), extra `environment` variable names for those commands, and approved `documentation` files
+- `agents.runner`: absolute Codex CLI `executable`, extra runner `environment` names, per-stage `timeoutMinutes`, `maxResultBytes`, `maxEventBytes`, and `rateLimitRetryMinutes`
+- `agents.commitAuthor`, `agents.documentation` (`root`, `files`, `maxBytes`), `agents.diffPolicy`, and `agents.maxReviewDiffBytes`
 - model tier identifiers under `models.tiers`; application code never accepts arbitrary model IDs from model output
 - Linear filters and retry limits
 
@@ -165,6 +171,45 @@ Git runs as a fixed executable with argument arrays, repository hooks disabled (
 
 Every tick, workspaces of `COMPLETED` and `CANCELLED` tasks are released. A worktree is removed only when it is registered at the orchestrator path, locked by the orchestrator for that task, marked for that task, and has no uncommitted or untracked files; removal never uses `--force`. Branches and their commits are kept. A worktree that cannot be released keeps `workspace_cleanup_blocked_reason` on its work unit and is retried on later ticks.
 
+## Supervised agent execution
+
+With `runAgents` enabled, a claimed task runs these stages. Each one is a stage handler, so the scheduler applies schedule gates, operator controls, heartbeats, and cancellation between them.
+
+| Stage | Work | Success | Failure |
+|---|---|---|---|
+| `ANALYZING` | Prepare worktrees, then a read-only analyzer returns a plan | `READY` | Invalid output, a plan that does not cover exactly the contract repositories, or a clarification request: `BLOCKED` for manual intervention |
+| `READY` | Run each repository's `setup` commands, then discard their artifacts | `IMPLEMENTING` | Setup failure: `BLOCKED` for manual intervention |
+| `IMPLEMENTING` | A workspace-write implementer changes the worktrees; the orchestrator verifies Git state, applies the diff policy, and commits locally | `TESTING` | Timeout, runner failure, invalid output, or rejected diff: discard changes and retry through `READY` with the next escalation route; `FAILED` after `maxImplementationAttempts` |
+| `TESTING` | Run `setup` and every `check`, then discard artifacts | `REVIEWING` | Request a fix (`FIXING`); `FAILED` after `maxQualityFixAttempts`; a command that cannot start blocks for manual intervention |
+| `FIXING` | A workspace-write fixer addresses the failing output or review findings, with the same checks as implementation | `TESTING` | An unapplied or rejected fix returns to `TESTING`, which consumes the next bounded attempt |
+| `REVIEWING` | A read-only reviewer inspects the committed diff | `BLOCKED` with the reason `Reviewed local branch ready; delivery is not enabled` and no manual-intervention flag | Requested changes: `FIXING`; `FAILED` after `maxReviewCycles`. Rejection or invalid output: `BLOCKED` for manual intervention |
+
+A reviewer approval with a blocker or major finding counts as a change request. Provider usage limits pause the task in `PAUSED_LIMIT` (`CODEX_USAGE_LIMIT`, using the provider's retry hint or `usageLimitPauseMinutes`), and rate limits pause it with `RATE_LIMIT` for `rateLimitRetryMinutes`. Pauses and cancellations do not consume an attempt. Implementation attempts, quality fixes, and review cycles are counted on the task and each increment is written in the transition that consumes it. An operator retry of a `FAILED` task resets the counters for one new bounded cycle.
+
+Every stage checkpoints its result against the exact commits it verified: an accepted plan, completed setup, the committed implementation, passing gates, an applied fix, and a review approval. A resumed, parked, or retried stage reuses them. Retrying a task parked with a reviewed branch re-verifies the workspaces and quality gates without calling an agent again.
+
+**Model routing.** The implementer's model and effort come from the deterministic escalation route for the contract complexity and attempt number. Fixes reuse the latest implementation route. The analyzer and reviewer use `models.analyzer` and `models.reviewer`. Model identifiers are always read from configuration.
+
+**Runner.** The Codex CLI runs as `codex exec --json --ephemeral --ignore-user-config --ignore-rules` in the task directory, which contains only the declared worktrees. The analyzer and reviewer use the `read-only` sandbox. The implementer and fixer use `workspace-write` with network access disabled and `/tmp` excluded; their only writable locations are the task directory and a private per-run `TMPDIR`. The runner receives an allowlisted environment (`PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `XDG_CONFIG_HOME`, `CODEX_HOME`, plus `agents.runner.environment`), and agent shell commands inherit only core variables. Each run has a timeout, cancellation through the stage abort signal, an event-stream size limit, a result size limit, and process-group termination. The final message must match a strict versioned JSON schema: `kelolakelas.agent.analysis/v1`, `implementation/v1`, `fix/v1`, or `review/v1`. No result field can name a command, tool, model, credential, or path outside the declared repositories.
+
+**Prompts.** Prompts contain the validated contract, the accepted plan, approved documentation loaded from `agents.documentation`, and redacted command output or review findings. All of it is wrapped as untrusted data that cannot change instructions. Attempt records store the prompt SHA-256, size, and template version, not the prompt.
+
+**Before every commit.** The orchestrator re-verifies each worktree: its Git directory still belongs to the registered clone, HEAD is on the task branch and unmoved by the agent, ownership markers and the lock reason match, and history descends from the base. It then stages all changes and rejects the whole attempt when any repository has:
+
+- no change in a repository the contract requires (implementation), or no change at all;
+- more than `maxChangedFiles` files, `maxChangedLines` lines, or `maxUnplannedFiles` files outside the accepted plan;
+- a path matching `forbiddenPaths` (defaults: `.git`, `.github`, `.gitmodules`, `CODEOWNERS`, `.husky`, `.npmrc`, `AGENTS.md`, `CLAUDE.md`, `.codex`, `.claude`, `.env` variants, `*.pem`, `*.key`, `id_rsa*`) or `generatedPaths` (defaults: `node_modules`, `dist`, `coverage`, `.next`, minified assets);
+- binary content outside `allowedBinaryPaths`, a symbolic link, or a submodule;
+- an added line matching a credential pattern or the literal value of a credential in the orchestrator environment.
+
+Commits use `agents.commitAuthor`, run with hooks disabled, and carry `Orchestrator-Task` and `Orchestrator-Stage` trailers. Nothing is pushed.
+
+**Quality gates.** `setup` and `checks` come only from `repositories.<name>.quality` and run as argument arrays in the worktree, without a shell, with a timeout, bounded output, and process-group termination. They receive `PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `CI=true`, and the names in `quality.environment`. Configuration rejects orchestrator credentials, `OPENAI_API_KEY`, and `CODEX_API_KEY` there. Output tails are redacted before they are stored or shown to a fixer.
+
+**Evidence.** Each stage run is a `task_attempts` row with its normalized `input`, schema-validated `result`, redacted `evidence` (quality outcomes, diff statistics, policy findings, commits), `usage` tokens, and `failure_category`. `GET /operator/tasks/:id` returns them with the task's attempt counters and selected model tier.
+
+**Trust boundary limits.** Quality commands execute code written by the agent, outside the Codex sandbox, with the service user's permissions minus credentials. The read-only sandbox limits writes, not reads: an agent can read any file the service user can read. Run the service as a dedicated user that cannot read secrets or other users' files, keep `/etc/ai-orchestrator/orchestrator.env` root-owned, and do not enable push or pull-request delivery until a stronger isolation boundary is evaluated.
+
 ## Pause and resume behavior
 
 A schedule or usage-limit pause requires a `resumeState` that the paused state can legally resume to. Pausing releases the lease. A limit pause resumes only after its `resume_after` time and when the schedule gate for its `resumeState` is open. A schedule pause resumes only when the gate for its `resumeState` opens. Stage handlers must be idempotent with respect to their checkpoints, because a resumed or parked stage runs again.
@@ -186,7 +231,7 @@ The HTTP server binds to `127.0.0.1:8089` by default. Do not expose it publicly.
 | `GET /healthz` | none | 200 unless a scheduler tick has run longer than the stuck threshold |
 | `GET /readyz` | none | 200 only when PostgreSQL answers, the last Linear poll succeeded, and the worker is not stopping |
 | `GET /status` | none | worker state, last tick and intake result, in-flight tasks, and task counts by state |
-| `GET /operator/controls`, `/operator/tasks`, `/operator/tasks/:id`, `/operator/actions` | bearer | controls, task status with lease and error fields, and the audit log |
+| `GET /operator/controls`, `/operator/tasks`, `/operator/tasks/:id`, `/operator/actions` | bearer | controls, task status with lease, error, attempt-counter, and model fields, stage attempts (task detail), and the audit log |
 | `POST /operator/pause`, `/operator/resume` | bearer | stop or allow new claims across all workers; in-flight tasks park at the next stage boundary |
 | `POST /operator/schedule-override` | bearer | set `normal`, `enabled`, or `disabled` |
 | `POST /operator/tasks/:id/retry` | bearer | re-queue a `BLOCKED` or `FAILED` task and clear its manual-intervention markers |
@@ -222,5 +267,8 @@ Secrets belong only in the environment file or service manager secret mechanism.
 - A work unit with `workspace_cleanup_blocked_reason` still has its worktree. Commit, move, or discard the listed changes; the next tick retries the release.
 - A `BLOCKED` task with `requires_manual_intervention` was recovered from an expired lease, failed a stage, or was flagged by an operator. Inspect `GET /operator/tasks/:id` and its audit history, then retry or cancel it.
 - If a task is paused, inspect its persisted `resume_state`, `pause_reason`, and attempt counters before resuming it.
+- A `BLOCKED` task without `requires_manual_intervention` whose last transition reason is `Reviewed local branch ready; delivery is not enabled` has a committed, gated, reviewed branch in its worktrees. Inspect it with `git log <base>..HEAD` in each worktree.
+- For an agent stage that blocked or failed, `GET /operator/tasks/:id` lists attempts with `failureCategory` (`invalid-output`, `needs-clarification`, `diff-rejected`, `workspace-integrity`, `quality-failed`, `quality-infrastructure`, `review-rejected`, and others) and redacted evidence. Fix the contract or configuration, then retry the task; accepted plans and commits are reused.
+- A `workspace-integrity` failure means an agent changed Git state (committed, switched branch, or rewrote the worktree's `.git` file). Inspect the worktree before retrying; the orchestrator does not repair it.
 - Database operations require a reachable PostgreSQL `DATABASE_URL` and applied migrations.
 - The systemd environment is intentionally separate from an interactive shell; verify the unit's `EnvironmentFile`, `WorkingDirectory`, `User`, and executable paths.

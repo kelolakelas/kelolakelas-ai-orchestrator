@@ -415,7 +415,15 @@ export class Scheduler {
 
         switch (outcome.kind) {
           case 'advance':
-            task = await tasks.transitionTask({ taskId: task.id, to: outcome.to, reason: outcome.reason ?? `${task.state} stage completed`, leaseOwner: workerId });
+            task = await tasks.transitionTask({
+              taskId: task.id,
+              to: outcome.to,
+              reason: outcome.reason ?? `${task.state} stage completed`,
+              leaseOwner: workerId,
+              ...(outcome.incrementCounter === undefined ? {} : { incrementCounter: outcome.incrementCounter }),
+              ...(outcome.lastError === undefined ? {} : { lastError: outcome.lastError.slice(0, maxErrorLength) }),
+              ...(outcome.requiresManualIntervention === undefined ? {} : { requiresManualIntervention: outcome.requiresManualIntervention }),
+            });
             this.options.log('stage_completed', { ...fields(stageTask), to: task.state });
             break;
           case 'pause-limit':

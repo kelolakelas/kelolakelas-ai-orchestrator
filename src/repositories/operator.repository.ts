@@ -1,5 +1,5 @@
 import { count, desc, eq, sql } from 'drizzle-orm';
-import { operatorActions, orchestratorControls, tasks } from '../db/schema.js';
+import { operatorActions, orchestratorControls, taskAttempts, tasks } from '../db/schema.js';
 import { canTransition } from '../orchestrator/state-machine.js';
 import type { ScheduleOverride, TaskState } from '../types/domain.js';
 import { transitionLockedTask, type Database, type DatabaseTransaction, type PersistedTask } from './task.repository.js';
@@ -49,7 +49,24 @@ export interface TaskStatusView {
   requiresManualIntervention: boolean;
   cancelRequestedAt: Date | null;
   lastError: string | null;
+  implementationAttempts: number;
+  qualityFixAttempts: number;
+  reviewAttempts: number;
+  selectedModelTier: string | null;
+  reasoningEffort: string | null;
   updatedAt: Date;
+}
+
+/** Operator-visible stage attempt. Inputs are digests and evidence is redacted before it is persisted. */
+export interface TaskAttemptView {
+  stage: TaskState;
+  attempt: number;
+  failureCategory: string | null;
+  input: Record<string, unknown> | null;
+  evidence: Record<string, unknown> | null;
+  usage: Record<string, unknown> | null;
+  startedAt: Date;
+  completedAt: Date | null;
 }
 
 const taskStatusColumns = {
@@ -65,6 +82,11 @@ const taskStatusColumns = {
   requiresManualIntervention: tasks.requiresManualIntervention,
   cancelRequestedAt: tasks.cancelRequestedAt,
   lastError: tasks.lastError,
+  implementationAttempts: tasks.implementationAttempts,
+  qualityFixAttempts: tasks.qualityFixAttempts,
+  reviewAttempts: tasks.reviewAttempts,
+  selectedModelTier: tasks.selectedModelTier,
+  reasoningEffort: tasks.reasoningEffort,
   updatedAt: tasks.updatedAt,
 };
 
@@ -97,6 +119,8 @@ export class OperatorRepository {
         requiresManualIntervention: false,
         lastError: null,
         clearCancelRequest: true,
+        // A failed task exhausted its bounded attempts; a deliberate operator retry grants one new bounded cycle.
+        resetAttemptCounters: task.state === 'FAILED',
       });
       await this.audit(transaction, 'RETRY_TASK', context, task.id, { from: task.state });
       return updated;
@@ -179,6 +203,19 @@ export class OperatorRepository {
   async getTaskStatus(taskId: string): Promise<TaskStatusView | undefined> {
     const selected = await this.db.select(taskStatusColumns).from(tasks).where(eq(tasks.id, taskId)).limit(1);
     return selected[0];
+  }
+
+  async listAttempts(taskId: string, limit = 200): Promise<TaskAttemptView[]> {
+    return this.db.select({
+      stage: taskAttempts.stage,
+      attempt: taskAttempts.attempt,
+      failureCategory: taskAttempts.failureCategory,
+      input: taskAttempts.input,
+      evidence: taskAttempts.evidence,
+      usage: taskAttempts.usage,
+      startedAt: taskAttempts.startedAt,
+      completedAt: taskAttempts.completedAt,
+    }).from(taskAttempts).where(eq(taskAttempts.taskId, taskId)).orderBy(desc(taskAttempts.startedAt)).limit(limit);
   }
 
   async listActions(taskId?: string, limit = 100): Promise<Array<typeof operatorActions.$inferSelect>> {

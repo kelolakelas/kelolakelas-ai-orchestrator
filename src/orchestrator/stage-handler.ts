@@ -1,12 +1,22 @@
 import type { PersistedTask } from '../repositories/task.repository.js';
-import type { PauseReason, TaskState } from '../types/domain.js';
+import type { AttemptCounter, PauseReason, TaskState } from '../types/domain.js';
 
 /**
  * Normalized result of one stage. Handlers never persist state themselves; the scheduler applies the outcome through
  * the state machine while it still holds the task lease.
  */
 export type StageOutcome =
-  | { kind: 'advance'; to: TaskState; reason?: string }
+  | {
+    kind: 'advance';
+    to: TaskState;
+    reason?: string;
+    /** Consumes one bounded attempt atomically with the transition. */
+    incrementCounter?: AttemptCounter;
+    /** Operator-visible explanation persisted as `last_error`. */
+    lastError?: string;
+    /** Stops automatic processing; use with `BLOCKED`. */
+    requiresManualIntervention?: boolean;
+  }
   | { kind: 'pause-limit'; pauseReason: Exclude<PauseReason, 'OPERATING_HOURS_ENDED'>; resumeAfter?: Date; reason?: string }
   /** The handler observed `signal.aborted`, recorded any checkpoint it needs, and stopped at a safe point. */
   | { kind: 'interrupted' };
