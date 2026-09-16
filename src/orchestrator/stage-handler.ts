@@ -26,11 +26,11 @@ export type StageOutcome =
   /** The handler observed `signal.aborted`, recorded any checkpoint it needs, and stopped at a safe point. */
   | { kind: 'interrupted' };
 
-export type StageAbortReason = 'shutdown' | 'schedule' | 'operator' | 'lease-lost';
+export type StageAbortReason = 'shutdown' | 'schedule' | 'operator' | 'kill-switch' | 'lease-lost';
 
 export interface StageContext {
   task: PersistedTask;
-  /** Aborted on shutdown, schedule closure (when `finishCurrentStep` is false), operator action, or lease loss. */
+  /** Aborted on shutdown, schedule closure (when `finishCurrentStep` is false), operator action, the kill switch, or lease loss. */
   signal: AbortSignal;
   checkpoint(checkpointKey: string, payload: Record<string, unknown>): Promise<void>;
   getCheckpoint(checkpointKey: string): Promise<Record<string, unknown> | undefined>;

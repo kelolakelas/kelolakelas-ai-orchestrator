@@ -42,7 +42,8 @@ export function classifyDeliveryError(deps: DeliveryDependencies, error: unknown
   const message = redactSecrets(error instanceof Error ? error.message : 'Unknown error', deps.knownSecrets);
   if (error instanceof GitHubRequestError) {
     if (error.kind === 'transient') {
-      return { category: 'provider-unavailable', outcome: { kind: 'wait', until: retryAt(), reason: 'GitHub unavailable', lastError: message } };
+      // An open circuit breaker carries its reopen time.
+      return { category: 'provider-unavailable', outcome: { kind: 'wait', until: retryAt(error.retryAfter), reason: 'GitHub unavailable', lastError: message } };
     }
     if (error.kind === 'rate-limit') {
       return { category: 'rate-limit', outcome: { kind: 'wait', until: retryAt(error.retryAfter), reason: 'GitHub rate limit', lastError: message } };

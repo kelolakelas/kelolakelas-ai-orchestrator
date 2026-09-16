@@ -1,0 +1,3 @@
+ALTER TABLE "orchestrator_controls" ADD COLUMN "kill_switch" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "state_transitions_task_id_created_at_idx" ON "state_transitions" USING btree ("task_id","created_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "state_transitions_to_state_created_at_idx" ON "state_transitions" USING btree ("to_state","created_at");

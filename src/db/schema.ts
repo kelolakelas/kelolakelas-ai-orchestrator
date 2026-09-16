@@ -53,7 +53,11 @@ export const stateTransitions = pgTable('state_transitions', {
   toState: taskStateEnum('to_state').notNull(),
   reason: text('reason'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  // State age, dwell time, and the rollout start budget read the latest transitions of a task.
+  index('state_transitions_task_id_created_at_idx').on(table.taskId, table.createdAt),
+  index('state_transitions_to_state_created_at_idx').on(table.toState, table.createdAt),
+]);
 
 export const taskDependencies = pgTable('task_dependencies', {
   taskId: uuid('task_id').notNull().references(() => tasks.id),
@@ -150,6 +154,8 @@ export const orchestratorControls = pgTable('orchestrator_controls', {
   id: text('id').primaryKey(),
   pauseNewWork: boolean('pause_new_work').notNull().default(false),
   scheduleOverride: text('schedule_override').$type<'normal' | 'enabled' | 'disabled'>().notNull().default('normal'),
+  /** Stops all stage execution and maintenance on every worker until released; read-only intake continues. */
+  killSwitch: boolean('kill_switch').notNull().default(false),
   updatedBy: text('updated_by'),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });

@@ -1,5 +1,6 @@
 import type { QualityCommand, RepositoryQualityConfig } from '../config/schema.js';
 import { allowlistedEnvironment, runBoundedProcess, type BoundedProcessOutcome } from './bounded-process.js';
+import { NoSandbox, type CommandSandbox } from './sandbox.js';
 import { redactSecrets } from './secrets.js';
 
 export type QualityPhase = 'setup' | 'check';
@@ -29,11 +30,16 @@ export interface RepositoryQualityReport {
 const baseCommandEnvironment = ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG'] as const;
 const tailBytes = 8 * 1024;
 const maxOutputBytes = 64 * 1024 * 1024;
+const noSandbox = new NoSandbox();
 
 export interface QualityGateRunnerOptions {
   quality: (repository: string) => RepositoryQualityConfig;
   sourceEnvironment: NodeJS.ProcessEnv;
   knownSecrets: readonly string[];
+  /** Confines every command. Defaults to no confinement. */
+  sandbox?: CommandSandbox;
+  /** Extra read-only paths a repository's commands need inside the sandbox, such as the clone's Git directory. */
+  readOnlyPaths?: (repository: string) => readonly string[];
 }
 
 /**
@@ -59,12 +65,21 @@ export class QualityGateRunner {
 
     for (const [phase, definition] of planned) {
       if (phase === 'check' && report.results.some((result) => result.phase === 'setup' && !result.passed)) break;
-      const [executable, ...args] = definition.command as [string, ...string[]];
+      const [command, ...commandArgs] = definition.command as [string, ...string[]];
+      const { executable, args, environment: sandboxEnvironment } = (this.options.sandbox ?? noSandbox).wrap({
+        executable: command,
+        args: commandArgs,
+        cwd: workspacePath,
+        writablePaths: [workspacePath],
+        readOnlyPaths: this.options.readOnlyPaths?.(repository) ?? [],
+        // Dependency installs usually need the network; checks of agent-written code do not.
+        network: definition.network ?? phase === 'setup',
+      });
       const execution = await runBoundedProcess({
         executable,
         args,
         cwd: workspacePath,
-        env: environment,
+        env: { ...environment, ...sandboxEnvironment },
         timeoutMs: definition.timeoutSeconds * 1_000,
         signal,
         tailBytes,
