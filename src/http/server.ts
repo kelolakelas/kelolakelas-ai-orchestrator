@@ -127,7 +127,12 @@ export function createHttpServer(options: HttpServerOptions): Server {
         const taskId = parseTaskId(segments[1]);
         const task = await options.operator.getTaskStatus(taskId);
         if (!task) throw new HttpError(404, 'Task not found');
-        return sendJson(response, 200, { task, attempts: await options.operator.listAttempts(taskId), actions: await options.operator.listActions(taskId) });
+        return sendJson(response, 200, {
+          task,
+          workUnits: await options.operator.listWorkUnits(taskId),
+          attempts: await options.operator.listAttempts(taskId),
+          actions: await options.operator.listActions(taskId),
+        });
       }
       throw new HttpError(404, 'Not found');
     }

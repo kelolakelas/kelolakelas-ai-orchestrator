@@ -16,6 +16,7 @@ import { createHttpServer } from './http/server.js';
 import { createLogger } from './observability/logger.js';
 import { Scheduler, type MaintenanceTask } from './orchestrator/scheduler.js';
 import type { StageHandlers } from './orchestrator/stage-handler.js';
+import { GitHubRestProvider } from './providers/github.js';
 import { LinearGraphqlProvider } from './providers/linear.js';
 import { OperatorRepository } from './repositories/operator.repository.js';
 import { TaskRepository } from './repositories/task.repository.js';
@@ -38,14 +39,19 @@ async function main(): Promise<void> {
   const workerId = configuredWorkerId ?? `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
   const log = (event: string, fields: Record<string, unknown> = {}) => logger.info({ ...fields, event }, event);
 
+  const githubToken = process.env.GITHUB_TOKEN;
+  if (config.orchestrator.execution.deliver && !githubToken) throw new Error('GITHUB_TOKEN is required when orchestrator.execution.deliver is true');
+  const linear = new LinearGraphqlProvider(config.linear, apiKey);
+
   const { db, pool } = createDatabase();
   pool.on('error', (error) => logger.error({ err: { name: error.name } }, 'PostgreSQL idle client error'));
   const tasks = new TaskRepository(db);
   const operator = new OperatorRepository(db);
 
   // Stage handlers are opt-in. Phase 4 prepares worktrees; Phase 5 adds analysis, implementation, quality gates, fixes,
-  // and review, and parks reviewed local branches because delivery does not exist yet. Workspace releases run whenever a
-  // registry is configured so terminal tasks never leave worktrees behind.
+  // and review; Phase 6 pushes reviewed branches, opens pull requests, and observes checks, reviews, and merges. Without
+  // delivery, reviewed local branches park in BLOCKED. Workspace releases run whenever a registry is configured so
+  // terminal tasks never leave worktrees behind.
   const handlers: StageHandlers = {};
   const maintenance: MaintenanceTask[] = [];
   if (config.workspace !== undefined) {
@@ -96,7 +102,10 @@ async function main(): Promise<void> {
         knownSecrets,
         clock: () => new Date(),
       };
-      Object.assign(handlers, createExecutionHandlers(execution, preparation));
+      const delivery = config.orchestrator.execution.deliver && config.delivery !== undefined && githubToken
+        ? { delivery: config.delivery, github: new GitHubRestProvider(config.delivery.github, githubToken), linear }
+        : undefined;
+      Object.assign(handlers, createExecutionHandlers(execution, preparation, delivery));
     } else if (config.orchestrator.execution.prepareWorkspaces) {
       handlers.ANALYZING = new WorkspacePreparationStage(workspaces, tasks, preparation);
     }
@@ -105,11 +114,12 @@ async function main(): Promise<void> {
       repositories: registry.names(),
       prepareWorkspaces: config.orchestrator.execution.prepareWorkspaces,
       runAgents: config.orchestrator.execution.runAgents,
+      deliver: config.orchestrator.execution.deliver,
     });
   }
   const scheduler = new Scheduler({
     config,
-    linear: new LinearGraphqlProvider(config.linear, apiKey),
+    linear,
     tasks,
     operator,
     workerId,

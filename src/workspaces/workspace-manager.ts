@@ -48,6 +48,10 @@ export interface TaskWorkspace extends WorkspaceIdentity {
   taskId: string;
 }
 
+export type RemoteBranchState =
+  | { kind: 'absent'; remoteHead: null }
+  | { kind: 'at-commit' | 'contains-commit' | 'diverged'; remoteHead: string };
+
 export interface CommitAuthor {
   name: string;
   email: string;
@@ -190,6 +194,75 @@ export class WorkspaceManager {
       if (parent !== head) throw new WorkspaceBlockedError(`Commit in ${repository.name} is not a child of the verified HEAD ${head}`);
       return { commit, parent };
     });
+  }
+
+  /**
+   * Describes the remote task branch relative to a reviewed local commit. `contains-commit` means the remote branch moved
+   * forward from the commit, for example when a reviewer updated the pull request branch; `diverged` means it no longer
+   * contains the commit (a force-push or an unrelated branch).
+   */
+  async inspectRemoteBranch(workspace: TaskWorkspace, commit: string, signal?: AbortSignal): Promise<RemoteBranchState> {
+    const repository = this.registry.get(workspace.repository);
+    return this.lock.withLock(repository.name, async () => {
+      await this.verifyRepository(repository);
+      return this.remoteBranchState(repository, workspace.branch, commit, signal);
+    });
+  }
+
+  /**
+   * Pushes a reviewed commit to the task branch on the registered remote. The worktree must still prove orchestrator
+   * ownership with `commit` as its HEAD, and the push never forces: a remote branch that moved elsewhere is rejected by
+   * Git and blocks for manual recovery. Repository hooks are disabled by the Git runner.
+   */
+  async pushTaskBranch(workspace: TaskWorkspace, commit: string, signal?: AbortSignal): Promise<RemoteBranchState> {
+    const repository = this.registry.get(workspace.repository);
+    return this.lock.withLock(repository.name, async () => {
+      await this.verifyRepository(repository);
+      const { head } = await this.verifyOwnedWorkspace(repository, workspace);
+      if (head !== commit) throw new WorkspaceBlockedError(`Worktree HEAD ${head} in ${repository.name} is not the reviewed commit ${commit}`);
+      const before = await this.remoteBranchState(repository, workspace.branch, commit, signal);
+      if (before.kind !== 'absent') return before;
+
+      const refspec = `${commit}:refs/heads/${workspace.branch}`;
+      try {
+        await this.git.run(['push', '--porcelain', '--no-verify', '--no-follow-tags', repository.remote, refspec], { cwd: repository.path });
+      } catch (error) {
+        if (error instanceof GitCommandError && /\[rejected\]|non-fast-forward|fetch first|stale info/i.test(error.message)) {
+          throw new WorkspaceBlockedError(`Remote branch ${workspace.branch} of ${repository.name} changed during push; manual recovery required`);
+        }
+        // The push may or may not have reached the remote; the next attempt reconciles by reading the remote branch.
+        throw new RemoteUnavailableError(repository.name, error);
+      }
+      const after = await this.remoteBranchState(repository, workspace.branch, commit, signal);
+      if (after.kind !== 'at-commit') throw new WorkspaceBlockedError(`Remote branch ${workspace.branch} of ${repository.name} is not at ${commit} after push`);
+      return after;
+    });
+  }
+
+  private async remoteBranchState(repository: RegisteredRepository, branch: string, commit: string, signal: AbortSignal | undefined): Promise<RemoteBranchState> {
+    const remoteOptions = { cwd: repository.path, ...(signal ? { signal } : {}) };
+    let output: string;
+    try {
+      output = await this.git.output(['ls-remote', '--heads', repository.remote, `refs/heads/${branch}`], remoteOptions);
+    } catch (error) {
+      throw new RemoteUnavailableError(repository.name, error);
+    }
+    const line = output.split('\n').find((entry) => entry.endsWith(`\trefs/heads/${branch}`));
+    const remoteHead = line?.split('\t')[0] ?? null;
+    if (remoteHead === null) return { kind: 'absent', remoteHead: null };
+    if (!/^[0-9a-f]{40}$/.test(remoteHead)) throw new WorkspaceBlockedError(`Remote branch ${branch} of ${repository.name} reported an invalid commit`);
+    if (remoteHead === commit) return { kind: 'at-commit', remoteHead };
+
+    if (await this.revParse(repository, remoteHead) === null) {
+      // Only the task branch is fetched, into its remote-tracking ref; nothing is checked out.
+      try {
+        await this.git.run(['fetch', '--no-tags', repository.remote, `+refs/heads/${branch}:refs/remotes/${repository.remote}/${branch}`], remoteOptions);
+      } catch (error) {
+        throw new RemoteUnavailableError(repository.name, error);
+      }
+    }
+    const contains = await this.git.run(['merge-base', '--is-ancestor', commit, remoteHead], { cwd: repository.path, allowFailure: true });
+    return { kind: contains.exitCode === 0 ? 'contains-commit' : 'diverged', remoteHead };
   }
 
   private async verifyOwnedWorkspace(repository: RegisteredRepository, workspace: TaskWorkspace): Promise<{ head: string }> {

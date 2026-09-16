@@ -98,10 +98,33 @@ const agentsSchema = z.object({
   maxReviewDiffBytes: z.number().int().positive().max(2 * 1024 * 1024).default(200_000),
 }).strict();
 
+const deliverySchema = z.object({
+  github: z.object({
+    apiUrl: z.string().url().default('https://api.github.com'),
+    requestTimeoutMs: z.number().int().positive().max(60_000).default(15_000),
+    /** Retries of idempotent reads after a transient failure. Writes are never retried blindly; they are reconciled. */
+    maxRetries: z.number().int().nonnegative().max(5).default(3),
+  }).strict().default({}),
+  /** Delay between observations of pending checks, reviews, and merges. */
+  pollIntervalSeconds: z.number().int().min(10).max(3_600).default(120),
+  /** Delay before retrying after a transient GitHub, Git remote, or Linear failure without a provider hint. */
+  retryIntervalSeconds: z.number().int().min(10).max(3_600).default(300),
+  /**
+   * How long a required check may stay missing or pending after the pull request head was first observed. Past this,
+   * the task blocks for manual intervention instead of waiting forever for a check that never runs.
+   */
+  requiredChecksTimeoutMinutes: z.number().int().positive().max(10_080).default(180),
+  draftPullRequests: z.boolean().default(false),
+  /** Posts idempotent Linear comments for delivery milestones. Pull request attachments are always synchronized. */
+  linearComments: z.boolean().default(true),
+}).strict();
+
 export const configSchema = z.object({
   timezone: z.string().min(1),
   orchestrator: z.object({
     maxConcurrentTasks: z.number().int().positive().default(1),
+    /** Tasks in delivery states (`PR_CREATED`, `WAITING_CI`, `READY_FOR_HUMAN_REVIEW`) claimed at once, counted separately. */
+    maxConcurrentDeliveryTasks: z.number().int().positive().default(2),
     pollingIntervalSeconds: z.number().int().positive().default(60),
     leaseDurationSeconds: z.number().int().min(30).default(300),
     heartbeatIntervalSeconds: z.number().int().positive().default(60),
@@ -119,6 +142,12 @@ export const configSchema = z.object({
        * `prepareWorkspaces`, `agents`, and quality checks for every registered repository. Never pushes.
        */
       runAgents: z.boolean().default(false),
+      /**
+       * Registers the Phase 6 delivery stages: push reviewed branches, open one pull request per repository, observe
+       * required checks, reviews, and merges, and synchronize Linear. Requires `runAgents`, `delivery`, and `GITHUB_TOKEN`.
+       * Never merges and never changes a Linear issue status.
+       */
+      deliver: z.boolean().default(false),
     }).default({}),
   }).default({}),
   workspace: z.object({
@@ -130,6 +159,7 @@ export const configSchema = z.object({
   }).strict().optional(),
   repositories: z.record(z.enum(repositoryNames), repositorySchema).default({}),
   agents: agentsSchema.optional(),
+  delivery: deliverySchema.optional(),
   schedule: z.object({
     enabled: z.boolean().default(true),
     allowMechanicalOperationsOutsideHours: z.boolean().default(true),
@@ -213,6 +243,15 @@ export const configSchema = z.object({
     }
   }
 
+  if (config.orchestrator.execution.deliver) {
+    if (!config.orchestrator.execution.runAgents) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['orchestrator', 'execution', 'runAgents'], message: 'must be true when orchestrator.execution.deliver is true' });
+    }
+    if (config.delivery === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['delivery'], message: 'is required when orchestrator.execution.deliver is true' });
+    }
+  }
+
   const exposures: Array<{ path: string[]; names: readonly string[]; withheld: readonly string[] }> = [
     { path: ['agents', 'runner', 'environment'], names: config.agents?.runner.environment ?? [], withheld: withheldEnvironment },
     // Repository commands execute model-written code, so they never receive model credentials either.
@@ -244,6 +283,7 @@ export type OrchestratorConfig = z.infer<typeof configSchema>;
 export type AgentsConfig = z.infer<typeof agentsSchema>;
 export type QualityCommand = z.infer<typeof qualityCommandSchema>;
 export type RepositoryQualityConfig = z.infer<typeof repositorySchema>['quality'];
+export type DeliveryConfig = z.infer<typeof deliverySchema>;
 export type ScheduleDay = keyof OrchestratorConfig['schedule']['days'];
 
 export function validateConfig(input: unknown): OrchestratorConfig {

@@ -5,7 +5,7 @@ import type { LinearProvider } from '../providers/linear.js';
 import type { OperatorRepository, OrchestratorControls } from '../repositories/operator.repository.js';
 import { LeaseOwnershipError, type ClaimableWork, type PersistedTask, type TaskRepository } from '../repositories/task.repository.js';
 import { operationGate, shouldInterruptRunningStage, stageGate } from '../scheduling/stage-gate.js';
-import { transitionMap, type TaskState } from '../types/domain.js';
+import { claimLaneOf, transitionMap, type ClaimLane, type TaskState } from '../types/domain.js';
 import { canTransition } from './state-machine.js';
 import type { StageAbortReason, StageHandlers } from './stage-handler.js';
 
@@ -258,20 +258,35 @@ export class Scheduler {
     const controls = this.controls;
     if (this.options.dryRun || this.stopping || controls === undefined || controls.pauseNewWork) return 0;
     const work = this.claimableWork(controls);
+    const { maxConcurrentTasks, maxConcurrentDeliveryTasks } = this.config.orchestrator;
+    // Delivery first: observing a pull request is short, and waiting for it must never hold an execution slot.
+    return await this.claimLane('delivery', work, maxConcurrentDeliveryTasks) + await this.claimLane('execution', work, maxConcurrentTasks);
+  }
+
+  private async claimLane(lane: ClaimLane, work: ClaimableWork, limit: number): Promise<number> {
+    const hasWork = lane === 'delivery'
+      ? work.parkedStates.some((state) => claimLaneOf(state) === 'delivery')
+      : work.queued || work.parkedStates.some((state) => claimLaneOf(state) === 'execution') || work.scheduleResumeStates.length > 0 || work.limitResumeStates.length > 0;
+    if (!hasWork) return 0;
     let claimed = 0;
-    while (!this.stopping && this.inFlight.size < this.config.orchestrator.maxConcurrentTasks) {
+    while (!this.stopping && this.inFlightIn(lane) < limit) {
       const task = await this.options.tasks.claimNextTask({
         leaseOwner: this.options.workerId,
         leaseDurationMs: this.timing.leaseDurationMs,
-        maxConcurrentTasks: this.config.orchestrator.maxConcurrentTasks,
+        maxConcurrentTasks: limit,
         now: this.now(),
         work,
+        lane,
       });
       if (!task) break;
       claimed += 1;
       this.startTask(task);
     }
     return claimed;
+  }
+
+  private inFlightIn(lane: ClaimLane): number {
+    return [...this.inFlight.values()].filter((entry) => claimLaneOf(entry.stage) === lane).length;
   }
 
   /** Translates handlers, schedule gates, and the operator override into the claim query's eligibility. */
@@ -421,7 +436,7 @@ export class Scheduler {
               reason: outcome.reason ?? `${task.state} stage completed`,
               leaseOwner: workerId,
               ...(outcome.incrementCounter === undefined ? {} : { incrementCounter: outcome.incrementCounter }),
-              ...(outcome.lastError === undefined ? {} : { lastError: outcome.lastError.slice(0, maxErrorLength) }),
+              ...(outcome.lastError === undefined ? {} : { lastError: outcome.lastError?.slice(0, maxErrorLength) ?? null }),
               ...(outcome.requiresManualIntervention === undefined ? {} : { requiresManualIntervention: outcome.requiresManualIntervention }),
             });
             this.options.log('stage_completed', { ...fields(stageTask), to: task.state });
@@ -438,6 +453,10 @@ export class Scheduler {
               releaseLease: true,
             });
             this.options.log('task_paused_limit', { ...fields(task), resumeAfter: task.resumeAfter });
+            return;
+          case 'wait':
+            task = await tasks.deferTask(task.id, workerId, outcome.until, outcome.lastError === undefined ? undefined : outcome.lastError?.slice(0, maxErrorLength) ?? null);
+            this.options.log('task_waiting', { ...fields(stageTask), until: outcome.until, reason: outcome.reason });
             return;
           case 'interrupted': {
             const reason = abortReason(controller.signal);

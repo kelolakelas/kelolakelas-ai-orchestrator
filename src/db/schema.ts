@@ -75,12 +75,22 @@ export const taskWorkUnits = pgTable('task_work_units', {
   baseCommit: text('base_commit'),
   workspaceReleasedAt: timestamp('workspace_released_at', { withTimezone: true }),
   workspaceCleanupBlockedReason: text('workspace_cleanup_blocked_reason'),
+  /** Reviewed commit pushed to the remote task branch. */
+  pushedCommit: text('pushed_commit'),
+  pullRequestNumber: integer('pull_request_number'),
+  pullRequestUrl: text('pull_request_url'),
+  /** Merge commit observed on GitHub and verified reachable from the remote base branch. */
+  mergeCommit: text('merge_commit'),
+  /** Latest normalized GitHub observation: pull request state, required checks, and reviews. */
+  deliveryObservation: jsonb('delivery_observation').$type<Record<string, unknown>>(),
+  deliveryObservedAt: timestamp('delivery_observed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex('task_work_units_task_repository_unique').on(table.taskId, table.repository),
   uniqueIndex('task_work_units_repository_branch_unique').on(table.repository, table.branch),
   uniqueIndex('task_work_units_workspace_path_unique').on(table.workspacePath),
+  uniqueIndex('task_work_units_repository_pull_request_unique').on(table.repository, table.pullRequestNumber),
 ]);
 
 export const taskAttempts = pgTable('task_attempts', {

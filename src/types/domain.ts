@@ -36,6 +36,18 @@ export type ScheduleOverride = 'normal' | 'enabled' | 'disabled';
 /** Per-task bounded retry counters, each incremented atomically with the transition that consumes an attempt. */
 export type AttemptCounter = 'implementationAttempts' | 'qualityFixAttempts' | 'reviewAttempts';
 
+/**
+ * Delivery states observe external systems (Git remotes, GitHub, Linear) and can wait days for people. They run in their
+ * own claim lane so a pull request awaiting review never occupies a slot of `maxConcurrentTasks`.
+ */
+export const deliveryStates: readonly TaskState[] = ['PR_CREATED', 'WAITING_CI', 'READY_FOR_HUMAN_REVIEW'];
+
+export type ClaimLane = 'execution' | 'delivery';
+
+export function claimLaneOf(state: TaskState): ClaimLane {
+  return deliveryStates.includes(state) ? 'delivery' : 'execution';
+}
+
 /** States that carry no further work and never hold a lease. */
 export const terminalStates: readonly TaskState[] = ['COMPLETED', 'CANCELLED'];
 
@@ -62,7 +74,9 @@ export const transitionMap: Readonly<Record<TaskState, readonly TaskState[]>> = 
   REVIEWING: ['PR_CREATED', 'FIXING', 'PAUSED_LIMIT', 'PAUSED_SCHEDULE', 'BLOCKED', 'FAILED'],
   PR_CREATED: ['WAITING_CI', 'BLOCKED'],
   WAITING_CI: ['READY_FOR_HUMAN_REVIEW', 'BLOCKED'],
-  READY_FOR_HUMAN_REVIEW: ['COMPLETED'],
+  // READY_FOR_HUMAN_REVIEW -> WAITING_CI re-observes required checks after the pull request head moves, for example when
+  // a reviewer updates the branch from the base branch.
+  READY_FOR_HUMAN_REVIEW: ['COMPLETED', 'WAITING_CI', 'BLOCKED'],
   PAUSED_SCHEDULE: ['ANALYZING', 'READY', 'IMPLEMENTING', 'TESTING', 'FIXING', 'REVIEWING', 'BLOCKED'],
   PAUSED_LIMIT: ['ANALYZING', 'IMPLEMENTING', 'FIXING', 'REVIEWING', 'BLOCKED'],
   BLOCKED: ['QUEUED'],

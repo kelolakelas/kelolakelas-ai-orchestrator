@@ -58,7 +58,12 @@ export type FailureCategory =
   | 'quality-failed'
   | 'quality-infrastructure'
   | 'review-changes-requested'
-  | 'review-rejected';
+  | 'review-rejected'
+  // Delivery (Phase 6)
+  | 'provider-unavailable'
+  | 'provider-rejected'
+  | 'delivery-rejected'
+  | 'linear-unavailable';
 
 const headsSchema = z.record(z.string());
 export type Heads = Record<string, string>;

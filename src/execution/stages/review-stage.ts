@@ -7,25 +7,30 @@ import {
   type ExecutionDependencies,
 } from './stage-support.js';
 
-/** Where an approved task waits until delivery exists. */
+/** Where an approved task waits when delivery is disabled. */
 export const reviewedLocalBranchReason = 'Reviewed local branch ready; delivery is not enabled';
+export const reviewAcceptedReason = 'Review accepted; delivering pull requests';
 
 /**
  * `REVIEWING`: a read-only reviewer inspects the committed diff that passed the quality gates. Requested changes start a
- * bounded fix cycle until `maxReviewCycles`. An approval is recorded against the reviewed commits and the task parks in
- * `BLOCKED` without manual intervention: push and pull-request creation belong to a later phase.
+ * bounded fix cycle until `maxReviewCycles`. An approval is recorded against the reviewed commits. With delivery enabled
+ * the task moves to `PR_CREATED`; otherwise it parks in `BLOCKED` without manual intervention.
  */
 export class ReviewStage implements StageHandler {
-  constructor(private readonly deps: ExecutionDependencies) {}
+  constructor(private readonly deps: ExecutionDependencies, private readonly options: { deliver: boolean } = { deliver: false }) {}
+
+  private accepted(): StageOutcome {
+    return this.options.deliver
+      ? { kind: 'advance', to: 'PR_CREATED', reason: reviewAcceptedReason }
+      : { kind: 'advance', to: 'BLOCKED', reason: reviewedLocalBranchReason };
+  }
 
   async run(context: StageContext): Promise<StageOutcome> {
     const { deps } = this;
     const { task } = context;
     const loaded = await loadTaskWorkspaces(deps, task);
     const approved = await readCheckpoint(context, checkpointKeys.reviewApproved, reviewApprovedSchema);
-    if (approved !== undefined && sameHeads(approved.heads, loaded.heads)) {
-      return { kind: 'advance', to: 'BLOCKED', reason: reviewedLocalBranchReason };
-    }
+    if (approved !== undefined && sameHeads(approved.heads, loaded.heads)) return this.accepted();
     const passed = await readCheckpoint(context, checkpointKeys.qualityPassed, qualityPassedSchema);
     if (passed === undefined || !sameHeads(passed.heads, loaded.heads)) {
       return manualIntervention('Review requires passing quality gates for the current commits');
@@ -76,7 +81,7 @@ export class ReviewStage implements StageHandler {
     if (verdict === 'approve') {
       await context.checkpoint(checkpointKeys.reviewApproved, { heads: loaded.heads, attempt: scope.attempt, summary: result.output.summary });
       await completeAttempt(scope, { category: null, result: result.output, evidence, usage: result.usage });
-      return { kind: 'advance', to: 'BLOCKED', reason: reviewedLocalBranchReason };
+      return this.accepted();
     }
     if (verdict === 'reject') {
       await completeAttempt(scope, { category: 'review-rejected', result: result.output, evidence, usage: result.usage });
