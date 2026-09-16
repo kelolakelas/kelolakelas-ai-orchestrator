@@ -1,4 +1,4 @@
-import { and, asc, count, eq, inArray, isNotNull, isNull, lt, lte, ne, notExists, notInArray, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, count, eq, exists, inArray, isNotNull, isNull, lt, lte, ne, notExists, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { alias } from 'drizzle-orm/pg-core';
 import type * as schema from '../db/schema.js';
@@ -10,6 +10,15 @@ import type { PauseReason, TaskState } from '../types/domain.js';
 export type Database = NodePgDatabase<typeof schema>;
 export type DatabaseTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 export type PersistedTask = typeof tasks.$inferSelect;
+export type PersistedWorkUnit = typeof taskWorkUnits.$inferSelect;
+
+/** A persisted workspace identity collides with another work unit's branch or path. */
+export class WorkspaceIdentityConflictError extends Error {
+  constructor(repository: string) {
+    super(`Workspace branch or path for ${repository} is already recorded by another work unit`);
+    this.name = 'WorkspaceIdentityConflictError';
+  }
+}
 
 /** Serializes claims across every orchestrator process sharing the database. */
 const claimLockName = 'kelolakelas.ai-orchestrator.task-claim';
@@ -169,6 +178,69 @@ export class TaskRepository {
 
   async ping(): Promise<void> {
     await this.db.execute(sql`select 1`);
+  }
+
+  async getWorkUnits(taskId: string): Promise<PersistedWorkUnit[]> {
+    return this.db.select().from(taskWorkUnits).where(eq(taskWorkUnits.taskId, taskId)).orderBy(asc(taskWorkUnits.repository));
+  }
+
+  /** Blocker tasks that are not `COMPLETED`, which means their work has not been merged into the base branch. */
+  async listUnfinishedBlockers(taskId: string): Promise<Array<{ id: string; linearIdentifier: string; state: TaskState }>> {
+    return this.db.select({ id: tasks.id, linearIdentifier: tasks.linearIdentifier, state: tasks.state })
+      .from(taskDependencies)
+      .innerJoin(tasks, eq(taskDependencies.blockerTaskId, tasks.id))
+      .where(and(eq(taskDependencies.taskId, taskId), ne(tasks.state, 'COMPLETED')));
+  }
+
+  /**
+   * Persists a work unit's workspace identity while the caller still holds the parent task lease. The unique indexes on
+   * repository/branch and workspace path reject a second task claiming the same branch or workspace.
+   */
+  async recordWorkUnitWorkspace(
+    taskId: string,
+    leaseOwner: string,
+    identity: { repository: string; workspacePath: string; branch: string; baseCommit: string },
+  ): Promise<PersistedWorkUnit> {
+    const leased = this.db.select({ id: tasks.id }).from(tasks).where(and(eq(tasks.id, taskId), eq(tasks.leaseOwner, leaseOwner)));
+    try {
+      const updated = await this.db.update(taskWorkUnits)
+        .set({ workspacePath: identity.workspacePath, branch: identity.branch, baseCommit: identity.baseCommit, workspaceReleasedAt: null, workspaceCleanupBlockedReason: null, updatedAt: new Date() })
+        .where(and(eq(taskWorkUnits.taskId, taskId), eq(taskWorkUnits.repository, identity.repository), exists(leased)))
+        .returning();
+      if (!updated[0]) throw new LeaseOwnershipError(taskId);
+      return updated[0];
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === '23505') {
+        throw new WorkspaceIdentityConflictError(identity.repository);
+      }
+      throw error;
+    }
+  }
+
+  /** Work units of terminal tasks whose workspace has not been released. */
+  async listWorkspacesPendingRelease(limit = 50): Promise<Array<PersistedWorkUnit & { workspacePath: string; branch: string }>> {
+    const rows = await this.db.select({ unit: taskWorkUnits })
+      .from(taskWorkUnits)
+      .innerJoin(tasks, eq(taskWorkUnits.taskId, tasks.id))
+      .where(and(
+        inArray(tasks.state, ['COMPLETED', 'CANCELLED']),
+        isNull(tasks.leaseOwner),
+        isNotNull(taskWorkUnits.workspacePath),
+        isNotNull(taskWorkUnits.branch),
+        isNull(taskWorkUnits.workspaceReleasedAt),
+      ))
+      .orderBy(asc(taskWorkUnits.updatedAt))
+      .limit(limit);
+    return rows.map((row) => row.unit as PersistedWorkUnit & { workspacePath: string; branch: string });
+  }
+
+  async markWorkspaceReleased(workUnitId: string, blockedReason: string | null): Promise<void> {
+    const now = new Date();
+    await this.db.update(taskWorkUnits)
+      .set(blockedReason === null
+        ? { workspaceReleasedAt: now, workspaceCleanupBlockedReason: null, updatedAt: now }
+        : { workspaceCleanupBlockedReason: blockedReason, updatedAt: now })
+      .where(eq(taskWorkUnits.id, workUnitId));
   }
 
   async getTask(taskId: string): Promise<PersistedTask | undefined> {

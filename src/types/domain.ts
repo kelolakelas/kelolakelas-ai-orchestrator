@@ -19,7 +19,7 @@ export const taskStates = [
 
 export type TaskState = (typeof taskStates)[number];
 
-export type PauseReason = 'OPERATING_HOURS_ENDED' | 'CODEX_USAGE_LIMIT' | 'RATE_LIMIT';
+export type PauseReason = 'OPERATING_HOURS_ENDED' | 'CODEX_USAGE_LIMIT' | 'RATE_LIMIT' | 'REMOTE_UNAVAILABLE';
 
 export type OperationType =
   | 'TASK_DISCOVERY'

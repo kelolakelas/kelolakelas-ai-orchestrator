@@ -21,6 +21,12 @@ export interface SchedulerTiming {
   stuckTickMs: number;
 }
 
+/** Deterministic housekeeping run on every non-dry-run tick, such as releasing workspaces of terminal tasks. */
+export interface MaintenanceTask {
+  readonly name: string;
+  run(): Promise<void>;
+}
+
 export interface SchedulerOptions {
   config: OrchestratorConfig;
   linear: LinearProvider;
@@ -30,6 +36,7 @@ export interface SchedulerOptions {
   dryRun: boolean;
   log: SchedulerLog;
   handlers?: StageHandlers;
+  maintenance?: readonly MaintenanceTask[];
   /** Set only when `workerId` is stable and unique per process, such as a systemd instance identity. */
   recoverOwnLeasesOnStart?: boolean;
   clock?: () => Date;
@@ -194,6 +201,7 @@ export class Scheduler {
       this.controls = await this.options.operator.getControls();
       const recovered = dryRun ? [] : await tasks.recoverExpiredLeases(this.now());
       this.logRecovered('scheduler_expired_leases_recovered', recovered);
+      if (!dryRun) await this.runMaintenance();
       await this.pollIntake();
       const claimed = await this.claimAvailableWork();
       this.options.log('scheduler_tick_completed', {
@@ -213,6 +221,16 @@ export class Scheduler {
       const message = errorMessage(error);
       this.lastTick = { ...this.lastTick, completedAt: this.now(), error: message };
       this.options.log('scheduler_tick_failed', { error: message });
+    }
+  }
+
+  private async runMaintenance(): Promise<void> {
+    for (const task of this.options.maintenance ?? []) {
+      try {
+        await task.run();
+      } catch (error) {
+        this.options.log('maintenance_failed', { maintenance: task.name, error: errorMessage(error) });
+      }
     }
   }
 

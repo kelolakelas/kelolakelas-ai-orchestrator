@@ -74,6 +74,21 @@ describe('scheduler', () => {
     expect(parts.tasks.claimNextTask).toHaveBeenCalledOnce();
   });
 
+  it('runs maintenance only outside dry-run and isolates maintenance failures', async () => {
+    const parts = fakes();
+    const failing = { name: 'failing', run: vi.fn().mockRejectedValue(new Error('git unavailable')) };
+    const succeeding = { name: 'succeeding', run: vi.fn().mockResolvedValue(undefined) };
+    const { instance, log } = scheduler(parts, { maintenance: [failing, succeeding] });
+    await instance.runOnce();
+    expect(succeeding.run).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith('maintenance_failed', { maintenance: 'failing', error: 'Error: git unavailable' });
+    expect(instance.status().lastTick.error).toBeNull();
+
+    const dryRun = scheduler(parts, { dryRun: true, maintenance: [succeeding] }).instance;
+    await dryRun.runOnce();
+    expect(succeeding.run).toHaveBeenCalledOnce();
+  });
+
   it('claims nothing when no stage handler is registered', async () => {
     const parts = fakes();
     const { instance } = scheduler(parts);

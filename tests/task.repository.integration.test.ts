@@ -3,6 +3,7 @@ import pg from 'pg';
 import { describe, expect, it } from 'vitest';
 import * as schema from '../src/db/schema.js';
 import { TaskRepository } from '../src/repositories/task.repository.js';
+import { resetDatabase } from './support/database.js';
 
 const integrationDatabaseUrl = process.env.MIGRATION_TEST_DATABASE_URL;
 const describeIntegration = integrationDatabaseUrl === undefined ? describe.skip : describe;
@@ -14,7 +15,7 @@ describeIntegration('task repository', () => {
     const repository = new TaskRepository(database);
 
     try {
-      await pool.query('TRUNCATE tasks CASCADE');
+      await resetDatabase(pool);
       const first = await repository.createTask({
         linearIssueId: 'issue-concurrent-1',
         linearIdentifier: 'KEL-101',
@@ -109,7 +110,7 @@ describeIntegration('task repository', () => {
       const workUnits = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM task_work_units WHERE task_id = $1', [dependent.id]);
       expect(workUnits.rows).toEqual([{ count: '2' }]);
     } finally {
-      await pool.query('TRUNCATE tasks CASCADE');
+      await resetDatabase(pool);
       await pool.end();
     }
   });
