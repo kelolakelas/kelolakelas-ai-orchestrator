@@ -1,7 +1,9 @@
 import { DateTime } from 'luxon';
+import pino from 'pino';
 import { describe, expect, it } from 'vitest';
 import { validateConfig } from '../src/config/schema.js';
 import { taskComplexityEnum } from '../src/db/schema.js';
+import { loggerOptions } from '../src/observability/logger.js';
 import { canRetry } from '../src/orchestrator/retry-policy.js';
 import { canTransition, InvalidTransitionError, transitionTask } from '../src/orchestrator/state-machine.js';
 import { escalationStep } from '../src/routing/escalation-policy.js';
@@ -52,6 +54,36 @@ describe('state machine', () => {
   it('requires a resumable state for pauses', () => {
     expect(() => transitionTask('IMPLEMENTING', 'PAUSED_SCHEDULE')).toThrow('resumeState');
     expect(transitionTask('IMPLEMENTING', 'PAUSED_SCHEDULE', { resumeState: 'IMPLEMENTING' }).resumeState).toBe('IMPLEMENTING');
+  });
+});
+
+describe('configuration validation', () => {
+  it('rejects invalid IANA timezones and missing model tiers', () => {
+    expect(() => validateConfig({ ...config, timezone: 'Asia/Not-A-Timezone' })).toThrow(/valid IANA timezone/);
+
+    const missingTier = structuredClone(config);
+    missingTier.models.analyzer.tier = 'missing';
+    expect(() => validateConfig(missingTier)).toThrow(/configured model tier/);
+  });
+});
+
+describe('structured logging', () => {
+  it('redacts configured credential fields', () => {
+    let output = '';
+    const logger = pino(loggerOptions, { write: (chunk: string) => {
+      output += chunk;
+      return true;
+    } });
+    const secret = 'never-log-this-token';
+
+    logger.info({
+      authorization: `Bearer ${secret}`,
+      environment: { LINEAR_API_KEY: secret },
+      headers: { 'x-api-key': secret },
+    }, 'Credential redaction test');
+
+    expect(output).not.toContain(secret);
+    expect(output).toContain('[REDACTED]');
   });
 });
 

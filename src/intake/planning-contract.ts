@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { complexityValues } from '../types/complexity.js';
 
 export const repositoryNames = [
   'web',
@@ -8,14 +9,7 @@ export const repositoryNames = [
   'billing',
 ] as const;
 
-export const complexityValues = [
-  'very-low',
-  'low',
-  'medium',
-  'high',
-  'very-high',
-  'critical',
-] as const;
+export { complexityValues } from '../types/complexity.js';
 
 const repositorySchema = z.enum(repositoryNames);
 const labelSchema = z.enum([...repositoryNames, 'ai-ready']);

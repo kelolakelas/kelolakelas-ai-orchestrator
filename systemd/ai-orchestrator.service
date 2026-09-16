@@ -8,9 +8,14 @@ Type=simple
 User=ai-orchestrator
 WorkingDirectory=/opt/ai-orchestrator
 EnvironmentFile=/etc/ai-orchestrator/orchestrator.env
+# Stable per-host identity so a restart recovers leases held by the previous process. Run one instance per host.
+Environment=ORCHESTRATOR_WORKER_ID=%H-ai-orchestrator
 ExecStart=/usr/bin/node /opt/ai-orchestrator/dist/src/index.js
 Restart=on-failure
 RestartSec=10
+KillSignal=SIGTERM
+# Longer than orchestrator.shutdownGracePeriodSeconds so stages can park before SIGKILL.
+TimeoutStopSec=60
 NoNewPrivileges=true
 
 [Install]

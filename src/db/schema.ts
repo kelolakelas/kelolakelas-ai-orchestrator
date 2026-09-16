@@ -1,19 +1,23 @@
-import { integer, pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
-import { complexityValues } from '../intake/planning-contract.js';
+import { boolean, index, integer, jsonb, pgEnum, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 
 const persistedTaskStates = [
   'QUEUED', 'ANALYZING', 'READY', 'IMPLEMENTING', 'TESTING', 'FIXING', 'REVIEWING',
   'PR_CREATED', 'WAITING_CI', 'READY_FOR_HUMAN_REVIEW', 'PAUSED_SCHEDULE', 'PAUSED_LIMIT',
-  'BLOCKED', 'FAILED', 'COMPLETED',
+  'BLOCKED', 'FAILED', 'COMPLETED', 'CANCELLED',
+] as const;
+
+const persistedTaskComplexities = [
+  'very-low', 'low', 'medium', 'high', 'very-high', 'critical',
 ] as const;
 
 export const taskStateEnum = pgEnum('task_state', [...persistedTaskStates]);
-export const taskComplexityEnum = pgEnum('task_complexity', [...complexityValues]);
+export const taskComplexityEnum = pgEnum('task_complexity', [...persistedTaskComplexities]);
 
 export const tasks = pgTable('tasks', {
   id: uuid('id').defaultRandom().primaryKey(),
   linearIssueId: text('linear_issue_id').notNull().unique(),
   linearIdentifier: text('linear_identifier').notNull(),
+  contractSnapshot: jsonb('contract_snapshot').$type<Record<string, unknown>>().notNull().default({}),
   repository: text('repository'),
   workspacePath: text('workspace_path'),
   branch: text('branch'),
@@ -32,6 +36,12 @@ export const tasks = pgTable('tasks', {
   pauseReason: text('pause_reason'),
   pausedAt: timestamp('paused_at', { withTimezone: true }),
   lastError: text('last_error'),
+  leaseOwner: text('lease_owner'),
+  leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+  lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
+  requiresManualIntervention: boolean('requires_manual_intervention').notNull().default(false),
+  resumeAfter: timestamp('resume_after', { withTimezone: true }),
+  cancelRequestedAt: timestamp('cancel_requested_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -44,3 +54,93 @@ export const stateTransitions = pgTable('state_transitions', {
   reason: text('reason'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const taskDependencies = pgTable('task_dependencies', {
+  taskId: uuid('task_id').notNull().references(() => tasks.id),
+  blockerTaskId: uuid('blocker_task_id').notNull().references(() => tasks.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.taskId, table.blockerTaskId] }),
+  index('task_dependencies_blocker_task_id_idx').on(table.blockerTaskId),
+]);
+
+export const taskWorkUnits = pgTable('task_work_units', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  taskId: uuid('task_id').notNull().references(() => tasks.id),
+  repository: text('repository').notNull(),
+  state: taskStateEnum('state').notNull().default('QUEUED'),
+  outcome: text('outcome'),
+  workspacePath: text('workspace_path'),
+  branch: text('branch'),
+  baseCommit: text('base_commit'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex('task_work_units_task_repository_unique').on(table.taskId, table.repository),
+]);
+
+export const taskAttempts = pgTable('task_attempts', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  taskId: uuid('task_id').notNull().references(() => tasks.id),
+  stage: taskStateEnum('stage').notNull(),
+  attempt: integer('attempt').notNull(),
+  failureCategory: text('failure_category'),
+  result: jsonb('result').$type<Record<string, unknown>>(),
+  startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+}, (table) => [
+  uniqueIndex('task_attempts_task_stage_attempt_unique').on(table.taskId, table.stage, table.attempt),
+]);
+
+export const taskCheckpoints = pgTable('task_checkpoints', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  taskId: uuid('task_id').notNull().references(() => tasks.id),
+  stage: taskStateEnum('stage').notNull(),
+  checkpointKey: text('checkpoint_key').notNull(),
+  payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
+  completedAt: timestamp('completed_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex('task_checkpoints_task_checkpoint_key_unique').on(table.taskId, table.checkpointKey),
+]);
+
+export const externalOperations = pgTable('external_operations', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  taskId: uuid('task_id').notNull().references(() => tasks.id),
+  operationType: text('operation_type').notNull(),
+  idempotencyKey: text('idempotency_key').notNull().unique(),
+  status: text('status').notNull().default('PENDING'),
+  request: jsonb('request').$type<Record<string, unknown>>().notNull().default({}),
+  response: jsonb('response').$type<Record<string, unknown>>(),
+  startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+});
+
+export const intakeQuarantines = pgTable('intake_quarantines', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  linearIssueId: text('linear_issue_id').notNull().unique(),
+  linearIdentifier: text('linear_identifier').notNull(),
+  reason: text('reason').notNull(),
+  payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
+  firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const orchestratorControls = pgTable('orchestrator_controls', {
+  id: text('id').primaryKey(),
+  pauseNewWork: boolean('pause_new_work').notNull().default(false),
+  scheduleOverride: text('schedule_override').$type<'normal' | 'enabled' | 'disabled'>().notNull().default('normal'),
+  updatedBy: text('updated_by'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const operatorActions = pgTable('operator_actions', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  action: text('action').notNull(),
+  actor: text('actor').notNull(),
+  reason: text('reason').notNull(),
+  taskId: uuid('task_id').references(() => tasks.id),
+  details: jsonb('details').$type<Record<string, unknown>>().notNull().default({}),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index('operator_actions_task_id_idx').on(table.taskId),
+]);

@@ -94,6 +94,7 @@ function minimumMinutesFor(config: OrchestratorConfig, operation: OperationType)
     case 'IMPLEMENTATION':
     case 'FIX': return config.schedule.minimumRemainingMinutesForImplementation;
     case 'REVIEW': return config.schedule.minimumRemainingMinutesForReview;
+    case 'QUALITY_GATE':
     case 'DELIVERY':
     case 'CI_CHECK': return 0;
   }
