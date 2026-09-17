@@ -140,11 +140,11 @@ describe('scheduler', () => {
     await stable.stop();
   });
 
-  it('claims delivery work in its own lane before execution work, each with its own limit', async () => {
+  it('claims execution and delivery work in separate lanes, each with its own limit', async () => {
     const parts = fakes();
     const { instance } = scheduler(parts, { handlers: { ANALYZING: noopHandler, WAITING_CI: noopHandler } });
     await instance.runOnce();
-    expect(parts.tasks.claimNextTask.mock.calls.map(([input]) => [input.lane, input.maxConcurrentTasks])).toEqual([['delivery', 2], ['execution', 1]]);
+    expect(parts.tasks.claimNextTask.mock.calls.map(([input]) => [input.lane, input.maxConcurrentTasks])).toEqual([['execution', 1], ['delivery', 2]]);
 
     const executionOnly = fakes();
     await scheduler(executionOnly, { handlers: { ANALYZING: noopHandler } }).instance.runOnce();

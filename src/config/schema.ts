@@ -27,6 +27,11 @@ const qualityCommandSchema = z.object({
   name: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'must be a lowercase command name'),
   command: z.array(z.string().min(1)).min(1),
   timeoutSeconds: z.number().int().positive().max(7_200).default(900),
+  /**
+   * Network access inside the command sandbox. Unset means setup commands (dependency installs) have network access and
+   * checks do not. Ignored when `sandbox.kind` is `none`.
+   */
+  network: z.boolean().optional(),
 }).strict();
 
 const uniqueCommands = z.array(qualityCommandSchema).superRefine((commands, context) => {
@@ -39,6 +44,8 @@ const repositorySchema = z.object({
   github: z.string().regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, 'must be owner/name'),
   remote: z.string().regex(/^[A-Za-z0-9._-]+$/, 'must be a Git remote name').default('origin'),
   baseBranch: gitRefComponent.default('main'),
+  /** Leased execution-lane tasks that may touch this repository at once, across all workers. Unset means no limit. */
+  maxConcurrentTasks: z.number().int().positive().optional(),
   quality: z.object({
     /** Runs before implementation and before every quality pass, for example a dependency install. */
     setup: uniqueCommands.default([]),
@@ -119,6 +126,64 @@ const deliverySchema = z.object({
   linearComments: z.boolean().default(true),
 }).strict();
 
+/**
+ * Confinement of repository setup and check commands, which execute agent-written code. `bubblewrap` runs each command
+ * in new user, PID, IPC, UTS, and cgroup namespaces with a fresh `/proc`, so orchestrator processes and their
+ * environments are invisible. Only the listed host paths are mounted, the worktree is the only writable repository
+ * path, and there is no home directory.
+ */
+const sandboxSchema = z.object({
+  kind: z.enum(['none', 'bubblewrap']).default('none'),
+  /** Absolute path of `bwrap`; it is never resolved through PATH. */
+  executable: absolutePath.default('/usr/bin/bwrap'),
+  /** Host paths mounted read-only at the same location when they exist. `/bin`, `/lib`, and similar are mirrored. */
+  readOnlyPaths: z.array(absolutePath).default(['/usr', '/etc', '/opt', '/run/systemd/resolve']),
+  /** Host paths writable by every sandboxed command, such as a dedicated package cache. Never a credential location. */
+  writablePaths: z.array(absolutePath).default([]),
+  /** Paths replaced by an empty directory even when a parent is mounted, such as the orchestrator's configuration. */
+  maskedPaths: z.array(absolutePath).default(['/etc/ai-orchestrator']),
+}).strict();
+
+const securitySchema = z.object({
+  /**
+   * Files that must not be readable by the service user when agents run, because agent and command processes run as
+   * that user. `~/` expands to the service user's home. A directory is exposed when any private file in it is readable.
+   */
+  credentialFiles: z.array(z.string().min(1)).default([
+    '~/.git-credentials', '~/.netrc', '~/.config/gh/hosts.yml', '~/.ssh', '~/.docker/config.json', '~/.npmrc',
+    '/etc/ai-orchestrator/orchestrator.env',
+  ]),
+  /**
+   * Starts delivery even when the startup credential-exposure audit reports findings. Findings are still logged. Use only
+   * for a non-production sandbox.
+   */
+  acceptCredentialExposure: z.boolean().default(false),
+}).strict();
+
+const circuitBreakerSchema = z.object({
+  /** Consecutive transient failures or rate limits that open the circuit. */
+  failureThreshold: z.number().int().positive().max(100).default(5),
+  /** How long an open circuit rejects calls before one probe is allowed. */
+  openSeconds: z.number().int().positive().max(3_600).default(300),
+}).strict();
+
+const retentionSchema = z.object({
+  enabled: z.boolean().default(true),
+  /** Attempt evidence and checkpoint payloads of `COMPLETED` and `CANCELLED` tasks are removed after this many days. */
+  terminalTaskArtifactDays: z.number().int().positive().default(90),
+  /** Quarantine records not seen by intake for this many days are removed; intake re-creates them if still present. */
+  quarantineDays: z.number().int().positive().default(30),
+  /** Leftover runner scratch directories older than this are removed. Must exceed the longest runner timeout. */
+  runnerScratchHours: z.number().int().positive().default(24),
+  intervalMinutes: z.number().int().positive().default(60),
+}).strict();
+
+const modelPriceSchema = z.object({
+  inputPerMillionTokens: z.number().nonnegative(),
+  cachedInputPerMillionTokens: z.number().nonnegative().default(0),
+  outputPerMillionTokens: z.number().nonnegative(),
+}).strict();
+
 export const configSchema = z.object({
   timezone: z.string().min(1),
   orchestrator: z.object({
@@ -133,7 +198,19 @@ export const configSchema = z.object({
     http: z.object({
       host: z.string().min(1).default('127.0.0.1'),
       port: z.number().int().min(0).max(65_535).default(8089),
+      /** Serves Prometheus metrics at `/metrics`. Metrics carry no task, issue, or credential identifiers. */
+      metrics: z.boolean().default(true),
     }).default({}),
+    /**
+     * Canary controls for starting new tasks. Tasks already started are unaffected, so narrowing the rollout never strands
+     * in-progress work.
+     */
+    rollout: z.object({
+      /** Only tasks whose every repository is listed may start. Unset allows every registered repository. */
+      repositories: z.array(z.enum(repositoryNames)).min(1).optional(),
+      /** New task starts (`QUEUED -> ANALYZING`) allowed across all workers in any rolling 24 hours. */
+      maxNewTasksPerDay: z.number().int().nonnegative().optional(),
+    }).strict().default({}),
     execution: z.object({
       /** Registers the Phase 4 workspace preparation stage. Requires `workspace` and `repositories`. */
       prepareWorkspaces: z.boolean().default(false),
@@ -156,10 +233,26 @@ export const configSchema = z.object({
     gitTimeoutSeconds: z.number().int().positive().max(3_600).default(300),
     repositoryLockTimeoutSeconds: z.number().int().positive().max(3_600).default(600),
     remoteRetryMinutes: z.number().int().positive().default(5),
+    /**
+     * `host` uses the service user's Git credential helpers or SSH keys, which agent processes can read. `github-token`
+     * authenticates HTTPS fetches and pushes with `GITHUB_TOKEN` passed only through Git's environment, so the service
+     * user needs no credential files.
+     */
+    gitAuthentication: z.enum(['host', 'github-token']).default('host'),
   }).strict().optional(),
   repositories: z.record(z.enum(repositoryNames), repositorySchema).default({}),
   agents: agentsSchema.optional(),
   delivery: deliverySchema.optional(),
+  sandbox: sandboxSchema.default({}),
+  security: securitySchema.default({}),
+  providers: z.object({
+    circuitBreaker: circuitBreakerSchema.default({}),
+  }).strict().default({}),
+  retention: retentionSchema.default({}),
+  metrics: z.object({
+    /** Prices by model identifier, used to export estimated spend. Models without a price export tokens only. */
+    modelPricing: z.record(modelPriceSchema).default({}),
+  }).strict().default({}),
   schedule: z.object({
     enabled: z.boolean().default(true),
     allowMechanicalOperationsOutsideHours: z.boolean().default(true),
@@ -252,6 +345,18 @@ export const configSchema = z.object({
     }
   }
 
+  const longestRunnerMinutes = config.agents === undefined ? 0 : Math.max(...Object.values(config.agents.runner.timeoutMinutes));
+  if (config.retention.runnerScratchHours * 60 <= longestRunnerMinutes) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['retention', 'runnerScratchHours'], message: 'must exceed the longest agents.runner.timeoutMinutes so a running agent keeps its scratch directory' });
+  }
+
+  for (const [path, paths] of [[['sandbox', 'writablePaths'], config.sandbox.writablePaths], [['sandbox', 'readOnlyPaths'], config.sandbox.readOnlyPaths]] as const) {
+    // Whole home directories hold credential files; a specific toolchain directory inside one, such as ~/.nvm, is allowed.
+    if (paths.some((entry) => /^\/(?:home(?:\/[^/]+)?|root|proc(?:\/.*)?|run\/credentials(?:\/.*)?)?\/?$/.test(entry))) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: [...path], message: 'must not expose /, a whole home directory, /proc, or systemd credentials' });
+    }
+  }
+
   const exposures: Array<{ path: string[]; names: readonly string[]; withheld: readonly string[] }> = [
     { path: ['agents', 'runner', 'environment'], names: config.agents?.runner.environment ?? [], withheld: withheldEnvironment },
     // Repository commands execute model-written code, so they never receive model credentials either.
@@ -284,6 +389,10 @@ export type AgentsConfig = z.infer<typeof agentsSchema>;
 export type QualityCommand = z.infer<typeof qualityCommandSchema>;
 export type RepositoryQualityConfig = z.infer<typeof repositorySchema>['quality'];
 export type DeliveryConfig = z.infer<typeof deliverySchema>;
+export type SandboxConfig = z.infer<typeof sandboxSchema>;
+export type CircuitBreakerConfig = z.infer<typeof circuitBreakerSchema>;
+export type RetentionConfig = z.infer<typeof retentionSchema>;
+export type ModelPrice = z.infer<typeof modelPriceSchema>;
 export type ScheduleDay = keyof OrchestratorConfig['schedule']['days'];
 
 export function validateConfig(input: unknown): OrchestratorConfig {

@@ -9,6 +9,8 @@ const controlsId = 'global';
 export interface OrchestratorControls {
   pauseNewWork: boolean;
   scheduleOverride: ScheduleOverride;
+  /** Stops stage execution on every worker; in-flight stages are interrupted and parked with their state and checkpoints. */
+  killSwitch: boolean;
   updatedBy: string | null;
   updatedAt: Date;
 }
@@ -22,6 +24,8 @@ export type OperatorActionType =
   | 'PAUSE_NEW_WORK'
   | 'RESUME_NEW_WORK'
   | 'SET_SCHEDULE_OVERRIDE'
+  | 'ENGAGE_KILL_SWITCH'
+  | 'RELEASE_KILL_SWITCH'
   | 'RETRY_TASK'
   | 'CANCEL_TASK'
   | 'REQUEST_CANCEL_TASK'
@@ -107,18 +111,30 @@ const taskStatusColumns = {
   updatedAt: tasks.updatedAt,
 };
 
+function controlsFromRow(row: typeof orchestratorControls.$inferSelect): OrchestratorControls {
+  return { pauseNewWork: row.pauseNewWork, scheduleOverride: row.scheduleOverride, killSwitch: row.killSwitch, updatedBy: row.updatedBy, updatedAt: row.updatedAt };
+}
+
 export class OperatorRepository {
   constructor(private readonly db: Database) {}
 
   async getControls(): Promise<OrchestratorControls> {
     const selected = await this.db.select().from(orchestratorControls).where(eq(orchestratorControls.id, controlsId)).limit(1);
     const row = selected[0];
-    if (!row) return { pauseNewWork: false, scheduleOverride: 'normal', updatedBy: null, updatedAt: new Date(0) };
-    return { pauseNewWork: row.pauseNewWork, scheduleOverride: row.scheduleOverride, updatedBy: row.updatedBy, updatedAt: row.updatedAt };
+    if (!row) return { pauseNewWork: false, scheduleOverride: 'normal', killSwitch: false, updatedBy: null, updatedAt: new Date(0) };
+    return controlsFromRow(row);
   }
 
   async setPauseNewWork(paused: boolean, context: OperatorContext): Promise<OrchestratorControls> {
     return this.updateControls({ pauseNewWork: paused }, paused ? 'PAUSE_NEW_WORK' : 'RESUME_NEW_WORK', context);
+  }
+
+  /**
+   * Engages or releases the kill switch. Engaging never changes task state: running stages stop at their next safe point
+   * and release their leases, so releasing the switch resumes every task from its last checkpoint.
+   */
+  async setKillSwitch(engaged: boolean, context: OperatorContext): Promise<OrchestratorControls> {
+    return this.updateControls({ killSwitch: engaged }, engaged ? 'ENGAGE_KILL_SWITCH' : 'RELEASE_KILL_SWITCH', context);
   }
 
   async setScheduleOverride(override: ScheduleOverride, context: OperatorContext): Promise<OrchestratorControls> {
@@ -260,7 +276,7 @@ export class OperatorRepository {
   }
 
   private async updateControls(
-    patch: Partial<Pick<OrchestratorControls, 'pauseNewWork' | 'scheduleOverride'>>,
+    patch: Partial<Pick<OrchestratorControls, 'pauseNewWork' | 'scheduleOverride' | 'killSwitch'>>,
     action: OperatorActionType,
     context: OperatorContext,
     details: Record<string, unknown> = {},
@@ -274,7 +290,7 @@ export class OperatorRepository {
       await this.audit(transaction, action, context, null, details);
       const row = rows[0];
       if (!row) throw new Error('Failed to update orchestrator controls');
-      return { pauseNewWork: row.pauseNewWork, scheduleOverride: row.scheduleOverride, updatedBy: row.updatedBy, updatedAt: row.updatedAt };
+      return controlsFromRow(row);
     });
   }
 

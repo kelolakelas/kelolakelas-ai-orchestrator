@@ -9,6 +9,8 @@ orchestrator:
   http:
     host: 127.0.0.1
     port: 8089
+    # Prometheus metrics at GET /metrics.
+    metrics: true
   execution:
     # Phase 4: prepare isolated worktrees for claimed tasks. Requires `workspace` and `repositories`.
     prepareWorkspaces: false
@@ -21,6 +23,10 @@ orchestrator:
     deliver: false
   # Delivery states (PR_CREATED, WAITING_CI, READY_FOR_HUMAN_REVIEW) use their own claim limit.
   maxConcurrentDeliveryTasks: 2
+  # Canary controls for starting new tasks; unset means no restriction.
+  # rollout:
+  #   repositories: [web]
+  #   maxNewTasksPerDay: 2
 schedule:
   enabled: true
   allowMechanicalOperationsOutsideHours: true
@@ -63,6 +69,8 @@ limits:
 #   gitTimeoutSeconds: 300
 #   repositoryLockTimeoutSeconds: 600
 #   remoteRetryMinutes: 5
+#   # github-token: fetch and push with GITHUB_TOKEN only, never host credential files. Required for production delivery.
+#   gitAuthentication: github-token
 # Quality commands are trusted argument arrays run in the worktree without a shell. They execute agent-written code, so
 # they receive no credentials; list extra variable names under `quality.environment` only when a command needs them.
 # A check fails only on a non-zero exit: a formatter must use a check mode that exits non-zero (`gofmt -l` does not).
@@ -72,6 +80,8 @@ limits:
 #     github: kelolakelas/kelolakelas-web
 #     remote: origin
 #     baseBranch: main
+#     # Leased execution tasks touching this repository across all workers.
+#     maxConcurrentTasks: 1
 #     quality:
 #       setup: [{ name: install, command: [npm, ci], timeoutSeconds: 900 }]
 #       checks:
@@ -120,3 +130,27 @@ limits:
 #   requiredChecksTimeoutMinutes: 180
 #   draftPullRequests: false
 #   linearComments: true
+# Quality commands run agent-written code. bubblewrap hides orchestrator processes and credentials from them; delivery
+# refuses to start without it unless security.acceptCredentialExposure is set. Setup commands get network access by
+# default and checks do not; set `network` on a command to override.
+# sandbox:
+#   kind: bubblewrap
+#   executable: /usr/bin/bwrap
+#   readOnlyPaths: [/usr, /etc, /opt, /run/systemd/resolve]
+#   writablePaths: [/var/cache/ai-orchestrator/npm]
+#   maskedPaths: [/etc/ai-orchestrator]
+# security:
+#   credentialFiles: [~/.git-credentials, ~/.netrc, ~/.config/gh/hosts.yml, ~/.ssh, ~/.docker/config.json, ~/.npmrc, /etc/ai-orchestrator/orchestrator.env]
+#   acceptCredentialExposure: false
+# providers:
+#   circuitBreaker: { failureThreshold: 5, openSeconds: 300 }
+# retention:
+#   enabled: true
+#   terminalTaskArtifactDays: 90
+#   quarantineDays: 30
+#   runnerScratchHours: 24
+#   intervalMinutes: 60
+# metrics:
+#   # Estimated spend per model identifier, in USD per million tokens.
+#   modelPricing:
+#     configurable-terra-model: { inputPerMillionTokens: 1.25, cachedInputPerMillionTokens: 0.125, outputPerMillionTokens: 10 }

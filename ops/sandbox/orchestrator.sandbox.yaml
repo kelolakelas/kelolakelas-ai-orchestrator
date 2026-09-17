@@ -1,0 +1,57 @@
+# Phase 7 sandbox delivery run: real GitHub and Linear, disposable repository and project. Never point this at the
+# production Linear team or KelolaKelas repositories. Follow the "Sandbox delivery run" runbook section.
+timezone: Asia/Jakarta
+orchestrator:
+  maxConcurrentTasks: 1
+  maxConcurrentDeliveryTasks: 1
+  pollingIntervalSeconds: 60
+  http: { host: 127.0.0.1, port: 8090 }
+  execution: { prepareWorkspaces: true, runAgents: true, deliver: true }
+  # One task per day and only the sandbox repository, even if the sandbox team gains other issues.
+  rollout: { repositories: [web], maxNewTasksPerDay: 1 }
+schedule:
+  enabled: false
+  days: {}
+linear:
+  # A dedicated sandbox team whose issues carry ai-ready and ai-sandbox.
+  teamKey: SBX
+  requiredLabels: [ai-ready, ai-sandbox]
+  excludedLabels: [human-only, blocked]
+models:
+  analyzer: { tier: terra, effort: medium }
+  reviewer: { tier: terra, effort: medium }
+  tiers:
+    luna: { model: configurable-luna-model }
+    terra: { model: configurable-terra-model }
+    sol: { model: configurable-sol-model }
+limits: { maxImplementationAttempts: 2, maxQualityFixAttempts: 2, maxReviewCycles: 2 }
+workspace:
+  root: /var/lib/ai-orchestrator-sandbox/workspaces
+  gitAuthentication: github-token
+repositories:
+  # The contract repository name is reused; the clone and GitHub repository are the disposable sandbox.
+  web:
+    path: /srv/orchestrator-sandbox/orchestrator-sandbox
+    github: kelolakelas/orchestrator-sandbox
+    maxConcurrentTasks: 1
+    quality:
+      setup: [{ name: install, command: [npm, ci], timeoutSeconds: 600 }]
+      checks:
+        - { name: lint, command: [npm, run, lint] }
+        - { name: test, command: [npm, test] }
+agents:
+  runner:
+    kind: codex-cli
+    executable: /usr/local/bin/codex
+    environment: [CODEX_HOME]
+  commitAuthor: { name: KelolaKelas Orchestrator Sandbox, email: ai-orchestrator-sandbox@kelolakelas.invalid }
+delivery:
+  pollIntervalSeconds: 60
+  requiredChecksTimeoutMinutes: 60
+  linearComments: true
+sandbox:
+  kind: bubblewrap
+  # Add the Node.js installation when it is outside /usr, for example /opt/node.
+  readOnlyPaths: [/usr, /etc, /opt, /run/systemd/resolve]
+  writablePaths: [/var/cache/ai-orchestrator-sandbox/npm]
+retention: { terminalTaskArtifactDays: 30 }

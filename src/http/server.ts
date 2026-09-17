@@ -5,7 +5,9 @@ import type { Scheduler } from '../orchestrator/scheduler.js';
 import { OperatorActionError, type OperatorRepository } from '../repositories/operator.repository.js';
 
 export interface HttpServerOptions {
-  scheduler: Pick<Scheduler, 'isLive' | 'status'>;
+  scheduler: Pick<Scheduler, 'isLive' | 'status' | 'refreshControls'>;
+  /** Prometheus exposition served at `/metrics`; omitted when metrics are disabled. */
+  metrics?: { render(): Promise<string> };
   operator: OperatorRepository;
   /** Checks PostgreSQL connectivity. */
   pingDatabase: () => Promise<void>;
@@ -23,6 +25,7 @@ const operatorContextSchema = z.object({
   reason: z.string().trim().min(1).max(500),
 }).strict();
 const scheduleOverrideSchema = operatorContextSchema.extend({ override: z.enum(['normal', 'enabled', 'disabled']) }).strict();
+const killSwitchSchema = operatorContextSchema.extend({ engaged: z.boolean() }).strict();
 const taskIdSchema = z.string().uuid();
 
 class HttpError extends Error {
@@ -108,6 +111,11 @@ export function createHttpServer(options: HttpServerOptions): Server {
       sendJson(response, result.ready ? 200 : 503, result);
       return;
     }
+    if (method === 'GET' && path === '/metrics' && options.metrics !== undefined) {
+      const body = await options.metrics.render();
+      response.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' }).end(body);
+      return;
+    }
     if (method === 'GET' && path === '/status') {
       const queue = await options.operator.queueSummary();
       sendJson(response, 200, { scheduler: options.scheduler.status(), queue });
@@ -149,6 +157,11 @@ export function createHttpServer(options: HttpServerOptions): Server {
     } else if (action === 'schedule-override') {
       const { override, ...context } = scheduleOverrideSchema.parse(body);
       result = await options.operator.setScheduleOverride(override, context);
+    } else if (action === 'kill-switch') {
+      const { engaged, ...context } = killSwitchSchema.parse(body);
+      result = await options.operator.setKillSwitch(engaged, context);
+      // This worker stops in-flight stages now; other workers apply the switch at their next heartbeat.
+      await options.scheduler.refreshControls();
     } else if (segments.length === 3 && segments[0] === 'tasks') {
       const taskId = parseTaskId(segments[1]);
       const context = operatorContextSchema.parse(body);

@@ -1,0 +1,30 @@
+[Unit]
+Description=AI orchestrator PostgreSQL backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=ai-orchestrator
+Group=ai-orchestrator
+WorkingDirectory=/opt/ai-orchestrator
+# Needs only DATABASE_URL. Use a dedicated file so the backup job never receives GitHub or Linear credentials.
+EnvironmentFile=/etc/ai-orchestrator/backup.env
+# Keep 14 days locally; copy dumps and their .json manifests off the host (see the backup runbook).
+ExecStart=/usr/bin/node /opt/ai-orchestrator/dist/src/ops/backup.js /var/backups/ai-orchestrator 14
+UMask=0077
+ReadWritePaths=/var/backups/ai-orchestrator
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+CapabilityBoundingSet=

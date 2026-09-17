@@ -1,0 +1,62 @@
+# promtool test rules alerts.test.yml
+rule_files: [alerts.yml]
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'orchestrator_scheduler_last_tick_timestamp_seconds{job="ai-orchestrator"}'
+        values: '0x30'
+      - series: 'orchestrator_leases_stale{job="ai-orchestrator"}'
+        values: '0 1x30'
+      - series: 'orchestrator_provider_circuit_state{job="ai-orchestrator",provider="github"}'
+        values: '2x30'
+      - series: 'orchestrator_provider_circuit_state{job="ai-orchestrator",provider="linear"}'
+        values: '0x30'
+      - series: 'orchestrator_task_state_age_seconds_max{job="ai-orchestrator",state="IMPLEMENTING"}'
+        values: '20000x30'
+      - series: 'orchestrator_task_state_age_seconds_max{job="ai-orchestrator",state="WAITING_CI"}'
+        values: '100x30'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: OrchestratorTickStalled
+        exp_alerts:
+          - exp_labels: { severity: critical, job: ai-orchestrator }
+            exp_annotations: { summary: No scheduler tick has completed for 10 minutes, runbook: "ai-orchestrator-operations.md#tick-stalled" }
+      - eval_time: 10m
+        alertname: OrchestratorStaleLeases
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: OrchestratorStaleLeases
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations: { summary: "1 expired lease(s) have not been recovered", runbook: "ai-orchestrator-operations.md#stuck-workflow" }
+      - eval_time: 20m
+        alertname: OrchestratorProviderCircuitOpen
+        exp_alerts:
+          - exp_labels: { severity: warning, provider: github }
+            exp_annotations: { summary: "The github circuit breaker has been open for 15 minutes", runbook: "ai-orchestrator-operations.md#provider-outage" }
+      - eval_time: 20m
+        alertname: OrchestratorExecutionStateStuck
+        exp_alerts:
+          - exp_labels: { severity: warning, state: IMPLEMENTING }
+            exp_annotations: { summary: "A task has been in IMPLEMENTING for more than 4 hours", runbook: "ai-orchestrator-operations.md#stuck-workflow" }
+      - eval_time: 20m
+        alertname: OrchestratorCiWaitLong
+        exp_alerts: []
+  - interval: 10m
+    input_series:
+      - series: 'orchestrator_model_cost_usd_total{job="ai-orchestrator",model="model-x"}'
+        values: '0+5x200'
+      - series: 'orchestrator_stage_runs_total{job="ai-orchestrator",stage="TESTING",outcome="failed"}'
+        values: '0x5 1x10'
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: OrchestratorModelSpendHigh
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations: { summary: "Estimated model spend in the last 24 hours is 720.00 USD", runbook: "ai-orchestrator-operations.md#retries-and-limits" }
+      - eval_time: 70m
+        alertname: OrchestratorStageFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations: { summary: A stage failed and blocked its task for manual intervention, runbook: "ai-orchestrator-operations.md#manual-intervention" }

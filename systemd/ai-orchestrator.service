@@ -6,17 +6,62 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ai-orchestrator
+Group=ai-orchestrator
 WorkingDirectory=/opt/ai-orchestrator
+# Owned by root with mode 0600. systemd reads it before dropping privileges, so neither the service user nor any agent
+# or quality command can read the file. The values reach only the orchestrator's environment, which the command sandbox
+# and the Codex sandbox hide from the processes they start.
 EnvironmentFile=/etc/ai-orchestrator/orchestrator.env
+Environment=ORCHESTRATOR_CONFIG=/etc/ai-orchestrator/orchestrator.yaml
 # Stable per-host identity so a restart recovers leases held by the previous process. Run one instance per host.
 Environment=ORCHESTRATOR_WORKER_ID=%H-ai-orchestrator
+# A home without credential files: the startup audit rejects readable Git, GitHub CLI, SSH, npm, and Docker credentials.
+Environment=HOME=/var/lib/ai-orchestrator/home
 ExecStart=/usr/bin/node /opt/ai-orchestrator/dist/src/index.js
 Restart=on-failure
 RestartSec=10
 KillSignal=SIGTERM
 # Longer than orchestrator.shutdownGracePeriodSeconds so stages can park before SIGKILL.
 TimeoutStopSec=60
+# Stop every descendant, including agents and sandboxed commands, with the service.
+KillMode=control-group
+
+# Resource limits. Agents and quality commands run inside this cgroup; size them for maxConcurrentTasks. When memory runs
+# out the kernel kills the largest process, normally a test run, and the service keeps running.
+MemoryHigh=12G
+MemoryMax=16G
+TasksMax=4096
+LimitNOFILE=65536
+CPUWeight=50
+IOWeight=50
+OOMPolicy=continue
+
+# Filesystem: everything read-only except state, workspaces, and the canonical clones.
+StateDirectory=ai-orchestrator
+StateDirectoryMode=0750
+ReadWritePaths=/srv/kelolakelas
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+UMask=0027
+
+# Process and kernel restrictions compatible with the bubblewrap command sandbox, verified with transient units on
+# systemd 259. ProtectKernelTunables, ProtectKernelLogs, and ProtectHostname are deliberately absent: they cover /proc
+# in a way that makes the kernel refuse the sandbox's fresh /proc mount. The orchestrator's startup sandbox check fails
+# fast if a local change breaks the sandbox.
 NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @mount
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# The sandbox needs every namespace type except time.
+RestrictNamespaces=user pid net ipc uts cgroup mnt
 
 [Install]
 WantedBy=multi-user.target

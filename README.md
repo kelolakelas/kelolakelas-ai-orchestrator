@@ -25,6 +25,8 @@ Phase 5 adds supervised agent execution: a structured analyzer, a write-enabled 
 
 Phase 6 adds GitHub delivery and Linear synchronization: it pushes reviewed branches, opens exactly one pull request per repository, observes required checks, reviews, and merges on GitHub, links pull requests and delivery milestones to the Linear issue, and completes a task only when every pull request is merged and reachable from its base branch.
 
+Phase 7 adds production hardening: quality commands in a bubblewrap sandbox, token-only Git authentication and a startup credential-exposure audit, an audited kill switch, per-repository and canary claim limits, provider circuit breakers and backpressure, Prometheus metrics with alert rules and a dashboard, artifact retention, backup and restore with a recovery drill, a credential check, a scheduler load test, and a hardened systemd unit. See [Production operations](#production-operations).
+
 Not implemented by design: merging, deployment, and changing a Linear issue's status.
 
 Consequently, by default the running service audits Linear intake, persists eligible tasks, recovers expired leases, and applies operator controls, but claims no task. With `orchestrator.execution.prepareWorkspaces: true` it claims tasks, prepares their worktrees, and parks them in `BLOCKED`. With `runAgents: true` as well, it analyzes, implements, tests, fixes, and reviews each task, then parks a reviewed local branch in `BLOCKED`. With `deliver: true` as well, it pushes and opens pull requests, waits for required checks and human merges, and completes the task. It never merges.
@@ -249,7 +251,13 @@ A retry after a crash, a lost response, or an operator retry therefore converges
 
 ### Delivery trust boundary
 
-Quality commands run agent-written code as the service user. On Linux, a process running as the same user can read the orchestrator's initial environment (`/proc/<pid>/environ`), which includes `GITHUB_TOKEN` and the other credentials, and can use the user's Git credentials. The environment allowlists in this service do not prevent that. Until quality commands and agents run under a separate user or a container without those credentials, keep `deliver` disabled in production, or accept that a malicious change can act with the token's permissions before a human reviews it. Use a fine-grained token limited to the registered repositories, and branch protection that requires review.
+Agents and quality commands run agent-written code as the service user. A process running as that user can read the orchestrator's environment (`/proc/<pid>/environ`), which holds `GITHUB_TOKEN` and the other credentials, and any credential file the user can read. Three controls close that exposure, and delivery refuses to start until the startup audit finds none missing:
+
+1. **Command sandbox** (`sandbox.kind: bubblewrap`). Every setup and check command runs in new user, PID, IPC, UTS, and network namespaces with a fresh `/proc`, so orchestrator processes and their environments are invisible. Only `sandbox.readOnlyPaths` and the worktree are mounted, `sandbox.maskedPaths` are emptied, and there is no home directory. Checks get no network unless a command sets `network: true`; setup commands get network by default. Codex already runs model-issued commands in its own PID-namespaced sandbox, so the runner is not wrapped again: bubblewrap cannot nest inside bubblewrap.
+2. **Token-only Git** (`workspace.gitAuthentication: github-token`). Fetches and pushes authenticate with `GITHUB_TOKEN` through Git's environment-only configuration; host credential helpers are cleared and SSH is refused. The service user needs no Git credentials.
+3. **Credential-exposure audit.** At startup the orchestrator reports a disabled sandbox, host Git authentication, readable files in `security.credentialFiles` (for example `~/.git-credentials`, `~/.config/gh/hosts.yml`, private SSH keys, or `/etc/ai-orchestrator/orchestrator.env`), a password-less `DATABASE_URL`, and a configuration writable by group or others. With `deliver` enabled any finding stops startup unless `security.acceptCredentialExposure` is set, which is meant only for a non-production sandbox.
+
+Remaining exposure: the runner's own model credential (`CODEX_HOME`) is readable by model-issued commands; the sandbox cannot restrict reads inside mounted paths; and processes with network access can reach local services such as PostgreSQL, which therefore requires password authentication. Use a fine-grained token limited to the registered repositories, and branch protection that requires review.
 
 ## Pause and resume behavior
 
@@ -278,8 +286,10 @@ The HTTP server binds to `127.0.0.1:8089` by default. Do not expose it publicly.
 | `POST /operator/tasks/:id/retry` | bearer | re-queue a `BLOCKED` or `FAILED` task and clear its manual-intervention markers |
 | `POST /operator/tasks/:id/cancel` | bearer | cancel an unleased task now, or request cancellation that its lease owner applies at the next heartbeat |
 | `POST /operator/tasks/:id/manual-intervention` | bearer | stop automatic processing; an unleased task enters `BLOCKED` when allowed |
+| `POST /operator/kill-switch` | bearer | `{"engaged": true}` stops every stage and maintenance on all workers; running stages stop at a safe point and park with their state and checkpoints. `false` releases it |
+| `GET /metrics` | none | Prometheus metrics (disable with `orchestrator.http.metrics: false`); no task, issue, or credential identifiers |
 
-Mutations take a JSON body `{"actor": "...", "reason": "..."}` (plus `override` for schedule overrides). Each mutation and its `operator_actions` audit row are written in one transaction. Responses exclude contract snapshots, provider payloads, and credentials.
+Mutations take a JSON body `{"actor": "...", "reason": "..."}` (plus `override` for schedule overrides and `engaged` for the kill switch). Each mutation and its `operator_actions` audit row are written in one transaction. Responses exclude contract snapshots, provider payloads, and credentials.
 
 ```sh
 curl -s -X POST http://127.0.0.1:8089/operator/pause \
@@ -287,22 +297,39 @@ curl -s -X POST http://127.0.0.1:8089/operator/pause \
   -d '{"actor":"ops@example.com","reason":"Incident 42"}'
 ```
 
+## Production operations
+
+Procedures (incident response, stuck workflows, kill switch, backup and restore, credential rotation, canary rollout, and recovery exercises) are in the operations runbook: `kelolakelas-docs/docs/runbooks/ai-orchestrator-operations.md`.
+
+- **Kill switch.** `POST /operator/kill-switch`, or `ORCHESTRATOR_KILL_SWITCH=true` for one worker when PostgreSQL is not trusted, for example right after a restore. Intake keeps running because it is read-only. Every engage and release is audited.
+- **Canary rollout.** `orchestrator.rollout.repositories` limits new tasks to listed repositories, and `maxNewTasksPerDay` caps task starts in any rolling 24 hours across workers. Started tasks are never stranded by narrowing it.
+- **Concurrency.** `repositories.<name>.maxConcurrentTasks` caps leased execution tasks touching a repository across workers. Each claim lane refills for at most one polling interval per tick, so many fast delivery observations cannot starve execution or intake.
+- **Backpressure.** GitHub and Linear calls go through per-process circuit breakers (`providers.circuitBreaker`). An open GitHub circuit holds delivery claims, and a runner usage or rate limit holds execution claims until the limit resets.
+- **Metrics and alerts.** `GET /metrics` exports queue size and age per state, stage duration and outcomes, CI wait (`orchestrator_state_dwell_seconds{state="WAITING_CI"}`), attempts by failure category, stale leases, provider calls and circuit state, model tokens and estimated cost (`metrics.modelPricing`), and control state. `ops/prometheus/alerts.yml` (with promtool tests) and `ops/grafana/ai-orchestrator-dashboard.json` use only these metrics; a unit test keeps them in sync.
+- **Retention.** Every `retention.intervalMinutes`, attempt evidence and checkpoint payloads of `COMPLETED`/`CANCELLED` tasks older than `terminalTaskArtifactDays` are removed, as are quarantines unseen for `quarantineDays` and runner scratch directories older than `runnerScratchHours`. Tasks, transitions, attempt inputs, results, usage, external operations, and operator actions are kept as the audit record.
+- **Backup and restore.** `node dist/src/ops/backup.js <dir> [keepDays]` writes a checksummed custom-format dump and manifest; `systemd/ai-orchestrator-backup.timer` runs it every 6 hours. `RESTORE_DATABASE_URL=... node dist/src/ops/restore.js <dump>` restores only into an empty database, in one transaction, and verifies row counts and migrations. Credentials reach `pg_dump`, `pg_restore`, and `psql` only through libpq environment variables. `tests/backup-restore.integration.test.ts` is the recovery drill.
+- **Credential check.** `node dist/src/ops/check-credentials.js` verifies, read-only, that `LINEAR_API_KEY` reads the team and `GITHUB_TOKEN` reads every registered repository, branch policy, and pull requests; it fails classic tokens with unneeded scopes and warns before expiry. Run it after every rotation.
+- **Load test.** `LOAD_TEST_DATABASE_URL=... npm run load:scheduler` runs several workers against a disposable database and fails if any execution, delivery, or repository limit is exceeded.
+- **Sandbox delivery run.** `ops/sandbox/orchestrator.sandbox.yaml` configures a run against a disposable GitHub repository and Linear team; `node dist/src/ops/sandbox-evidence.js <IDENTIFIER>` records the run and verifies exactly one pull request per work unit.
+
 ## Service template
 
-`systemd/ai-orchestrator.service` is a deployment template for the long-running scheduler. It sets a stable per-host `ORCHESTRATOR_WORKER_ID` and a stop timeout longer than the shutdown grace period. Until stage handlers exist, enabling it runs a continuous intake auditor that claims no tasks. Run it as a dedicated non-root user, create `/etc/ai-orchestrator/orchestrator.env` with restricted permissions, install dependencies, build, migrate the database, and then enable the service:
+`systemd/ai-orchestrator.service` is a hardened deployment template. It sets a stable per-host `ORCHESTRATOR_WORKER_ID`, a stop timeout longer than the shutdown grace period, `KillMode=control-group`, memory and task limits for the whole service including agents, and filesystem and system-call restrictions that the command sandbox tolerates. `ProtectKernelTunables`, `ProtectKernelLogs`, and `ProtectHostname` are left out on purpose: they make the kernel refuse the sandbox's `/proc` mount, and the orchestrator's startup sandbox check would fail. Hosts must allow unprivileged user namespaces (on Ubuntu 24.04, `kernel.apparmor_restrict_unprivileged_userns=0` or an AppArmor profile for `bwrap`).
+
+Run it as the dedicated `ai-orchestrator` user with a home under `/var/lib/ai-orchestrator/home` that holds no credentials. Create `/etc/ai-orchestrator/orchestrator.env` owned by `root:root` with mode `0600`; systemd reads it before dropping privileges. Keep the configuration at `/etc/ai-orchestrator/orchestrator.yaml`, writable only by root. Install dependencies, build, migrate the database, and then enable the service:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now ai-orchestrator
+sudo systemctl enable --now ai-orchestrator ai-orchestrator-backup.timer
 journalctl -u ai-orchestrator -f
 ```
 
-Secrets belong only in the environment file or service manager secret mechanism. They must never be logged. The future startup diagnostics may report `whoami` and `HOME`, but not credential values.
+Secrets belong only in the environment file or service manager secret mechanism. They are never logged.
 
 ## Troubleshooting
 
 - Config errors fail startup with Zod validation details. Check time format (`HH:mm`), IANA timezone names, and required model tiers.
-- If no work starts, check `GET /status` for `pauseNewWork` and `scheduleOverride`, the current local time in the configured timezone, the minimum remaining-time guards, and whether a stage handler exists for the task's stage.
+- If no work starts, check `GET /status` for `pauseNewWork`, `scheduleOverride`, `killSwitch` (and `killSwitchSource`), and `laneHolds`, the `orchestrator.rollout` limits and repository `maxConcurrentTasks`, the current local time in the configured timezone, the minimum remaining-time guards, and whether a stage handler exists for the task's stage.
 - If `/readyz` fails, its `checks` object names the unavailable dependency: `database`, `linear`, or `scheduler`.
 - A task `BLOCKED` during preparation names the conflict in `last_error`. Resolve it in the local clone (for example remove a stale branch you own, or push the dependency), then retry the task. Never delete a worktree carrying the orchestrator lock reason while its task is active.
 - A work unit with `workspace_cleanup_blocked_reason` still has its worktree. Commit, move, or discard the listed changes; the next tick retries the release.
@@ -314,5 +341,8 @@ Secrets belong only in the environment file or service manager secret mechanism.
 - Disabling `deliver` leaves tasks already in delivery states unclaimed until it is enabled again.
 - For an agent stage that blocked or failed, `GET /operator/tasks/:id` lists attempts with `failureCategory` (`invalid-output`, `needs-clarification`, `diff-rejected`, `workspace-integrity`, `quality-failed`, `quality-infrastructure`, `review-rejected`, and others) and redacted evidence. Fix the contract or configuration, then retry the task; accepted plans and commits are reused.
 - A `workspace-integrity` failure means an agent changed Git state (committed, switched branch, or rewrote the worktree's `.git` file). Inspect the worktree before retrying; the orchestrator does not repair it.
+- Startup fails with `credential exposure audit reported N finding(s)`: the preceding `credential_exposure_finding` log lines name each check and path. Fix them rather than setting `security.acceptCredentialExposure`.
+- Startup fails with `Command sandbox bubblewrap failed its startup check`: the host blocks unprivileged user namespaces, `sandbox.executable` is wrong, or a systemd option hides `/proc`. Run the probe from the runbook as the service user.
+- A quality command fails only in the sandbox: a tool outside `sandbox.readOnlyPaths` (for example a Node.js installation under `/opt/node`), a cache directory that must be listed in `sandbox.writablePaths`, or a check that needs `network: true`.
 - Database operations require a reachable PostgreSQL `DATABASE_URL` and applied migrations.
 - The systemd environment is intentionally separate from an interactive shell; verify the unit's `EnvironmentFile`, `WorkingDirectory`, `User`, and executable paths.

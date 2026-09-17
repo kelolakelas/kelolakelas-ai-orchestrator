@@ -26,12 +26,34 @@ export class GitCommandError extends Error {
   }
 }
 
-export function gitEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function gitEnvironment(source: NodeJS.ProcessEnv = process.env, githubToken?: string): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { LANG: 'C', LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' };
   for (const name of inheritedEnvironment) {
     const value = source[name];
     if (value !== undefined) environment[name] = value;
   }
+  if (githubToken === undefined) return environment;
+  delete environment.SSH_AUTH_SOCK;
+  return { ...environment, ...githubTokenGitEnvironment(githubToken) };
+}
+
+/**
+ * Authenticates HTTPS requests to github.com with a token supplied through Git's environment-only configuration, never
+ * through arguments, files, or the remote URL. Credential helpers from system and user configuration are cleared so
+ * no credential file is consulted, and SSH is refused so an SSH key cannot be used instead.
+ */
+export function githubTokenGitEnvironment(token: string): NodeJS.ProcessEnv {
+  const basic = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
+  const entries: Array<[string, string]> = [
+    ['credential.helper', ''],
+    ['http.https://github.com/.extraHeader', `Authorization: Basic ${basic}`],
+    ['protocol.ssh.allow', 'never'],
+  ];
+  const environment: NodeJS.ProcessEnv = { GIT_CONFIG_COUNT: String(entries.length), GIT_ASKPASS: '/bin/false', SSH_ASKPASS: '/bin/false' };
+  entries.forEach(([key, value], index) => {
+    environment[`GIT_CONFIG_KEY_${index}`] = key;
+    environment[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
   return environment;
 }
 

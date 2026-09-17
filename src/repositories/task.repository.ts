@@ -113,6 +113,20 @@ export interface TaskClaimWithLimitInput extends TaskClaimInput {
   maxConcurrentTasks: number;
   /** `execution` (the default) claims every non-delivery state; `delivery` claims only parked delivery states. */
   lane?: ClaimLane;
+  /**
+   * Leased execution-lane tasks allowed per repository, counted across all workers. A task is claimable only when every
+   * one of its repositories is below its limit. Ignored for the delivery lane, which only observes external systems.
+   */
+  repositoryLimits?: Readonly<Record<string, number>>;
+  /** Canary limits applied only when starting a `QUEUED` task. */
+  rollout?: TaskRolloutLimits;
+}
+
+export interface TaskRolloutLimits {
+  /** Every repository of a new task must be listed. */
+  repositories?: readonly string[] | undefined;
+  /** Task starts (`QUEUED -> ANALYZING`) allowed in the 24 hours before `now`. */
+  maxNewTasksPerDay?: number | undefined;
 }
 
 export interface LockedTransitionInput {
@@ -371,14 +385,48 @@ export class TaskRepository {
       const leased = await transaction.select({ value: count() }).from(tasks).where(and(isNotNull(tasks.leaseOwner), laneCondition));
       if ((leased[0]?.value ?? 0) >= input.maxConcurrentTasks) return undefined;
 
+      // Repositories at their execution limit exclude every task that touches them, in any claimable state.
+      const saturatedRepositories: string[] = [];
+      const repositoryLimits = Object.entries(lane === 'execution' ? input.repositoryLimits ?? {} : {});
+      if (repositoryLimits.length > 0) {
+        const busy = await transaction
+          .select({ repository: taskWorkUnits.repository, leased: sql<number>`count(distinct ${tasks.id})`.mapWith(Number) })
+          .from(taskWorkUnits)
+          .innerJoin(tasks, eq(taskWorkUnits.taskId, tasks.id))
+          .where(and(isNotNull(tasks.leaseOwner), laneCondition, inArray(taskWorkUnits.repository, repositoryLimits.map(([name]) => name))))
+          .groupBy(taskWorkUnits.repository);
+        for (const [repository, limit] of repositoryLimits) {
+          if ((busy.find((row) => row.repository === repository)?.leased ?? 0) >= limit) saturatedRepositories.push(repository);
+        }
+      }
+
+      let startNewTasks = work.queued;
+      const rollout = input.rollout ?? {};
+      if (startNewTasks && rollout.maxNewTasksPerDay !== undefined) {
+        const started = await transaction.select({ value: count() }).from(stateTransitions).where(and(
+          eq(stateTransitions.fromState, 'QUEUED'),
+          eq(stateTransitions.toState, 'ANALYZING'),
+          sql`${stateTransitions.createdAt} > ${new Date(now.getTime() - 24 * 60 * 60 * 1_000)}`,
+        ));
+        if ((started[0]?.value ?? 0) >= rollout.maxNewTasksPerDay) startNewTasks = false;
+      }
+
       const eligibility: SQL[] = [];
-      if (work.queued) {
+      if (startNewTasks) {
         const unresolvedBlockers = transaction
           .select({ taskId: taskDependencies.taskId })
           .from(taskDependencies)
           .innerJoin(blockers, eq(taskDependencies.blockerTaskId, blockers.id))
           .where(and(eq(taskDependencies.taskId, tasks.id), ne(blockers.state, 'COMPLETED')));
-        eligibility.push(and(eq(tasks.state, 'QUEUED'), notExists(unresolvedBlockers)) as SQL);
+        const outsideRollout = transaction
+          .select({ taskId: taskWorkUnits.taskId })
+          .from(taskWorkUnits)
+          .where(and(eq(taskWorkUnits.taskId, tasks.id), notInArray(taskWorkUnits.repository, [...(rollout.repositories ?? [])])));
+        eligibility.push(and(
+          eq(tasks.state, 'QUEUED'),
+          notExists(unresolvedBlockers),
+          ...(rollout.repositories === undefined ? [] : [notExists(outsideRollout)]),
+        ) as SQL);
       }
       if (work.parkedStates.length > 0) {
         // A stage that returned `wait` is claimable again only after its `resume_after`.
@@ -398,11 +446,16 @@ export class TaskRepository {
 
       // Finish in-progress work before resuming paused work, and resume paused work before starting new work.
       const priority = sql`case when ${tasks.state} = 'QUEUED' then 2 when ${tasks.state} in ('PAUSED_SCHEDULE', 'PAUSED_LIMIT') then 1 else 0 end`;
+      const touchesSaturatedRepository = transaction
+        .select({ taskId: taskWorkUnits.taskId })
+        .from(taskWorkUnits)
+        .where(and(eq(taskWorkUnits.taskId, tasks.id), inArray(taskWorkUnits.repository, saturatedRepositories)));
       const candidates = await transaction
         .select()
         .from(tasks)
         .where(and(
           isNull(tasks.leaseOwner),
+          ...(saturatedRepositories.length === 0 ? [] : [notExists(touchesSaturatedRepository)]),
           eq(tasks.requiresManualIntervention, false),
           isNull(tasks.cancelRequestedAt),
           or(...eligibility),
@@ -511,6 +564,15 @@ export class TaskRepository {
     const task = updated[0];
     if (!task) throw new LeaseOwnershipError(taskId);
     return task;
+  }
+
+  /** When the task last entered `state`, from transition history; `undefined` when it never did. */
+  async stateEnteredAt(taskId: string, state: TaskState): Promise<Date | undefined> {
+    const rows = await this.db.select({ createdAt: stateTransitions.createdAt }).from(stateTransitions)
+      .where(and(eq(stateTransitions.taskId, taskId), eq(stateTransitions.toState, state)))
+      .orderBy(desc(stateTransitions.createdAt))
+      .limit(1);
+    return rows[0]?.createdAt;
   }
 
   async recordCheckpoint(taskId: string, stage: TaskState, checkpointKey: string, payload: Record<string, unknown>): Promise<void> {

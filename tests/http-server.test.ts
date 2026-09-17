@@ -14,7 +14,7 @@ function status(overrides: Partial<SchedulerStatus> = {}): SchedulerStatus {
     workerId: 'worker-test', dryRun: false, started: true, stopping: false,
     lastTick: { startedAt: null, completedAt: null, error: null },
     lastIntake: { at: new Date(), ok: true, eligible: 0, quarantined: 0, ignored: 0 },
-    controls: null, inFlight: [],
+    controls: null, killSwitchSource: null, laneHolds: {}, inFlight: [],
     ...overrides,
   };
 }
@@ -25,6 +25,7 @@ async function serve(overrides: Partial<HttpServerOptions> = {}) {
     getControls: vi.fn(),
     setPauseNewWork: vi.fn().mockResolvedValue({ pauseNewWork: true, scheduleOverride: 'normal' }),
     setScheduleOverride: vi.fn().mockResolvedValue({ pauseNewWork: false, scheduleOverride: 'disabled' }),
+    setKillSwitch: vi.fn().mockResolvedValue({ pauseNewWork: false, scheduleOverride: 'normal', killSwitch: true }),
     retryTask: vi.fn().mockResolvedValue({ id: taskId, state: 'QUEUED', contractSnapshot: { secret: 'contract body' } }),
     cancelTask: vi.fn().mockRejectedValue(new OperatorActionError('Task cannot be cancelled from COMPLETED', 'CONFLICT')),
     requireManualIntervention: vi.fn(),
@@ -35,7 +36,7 @@ async function serve(overrides: Partial<HttpServerOptions> = {}) {
     listWorkUnits: vi.fn().mockResolvedValue([]),
   };
   const server = createHttpServer({
-    scheduler: { isLive: () => true, status: () => status() },
+    scheduler: { isLive: () => true, refreshControls: async () => undefined, status: () => status() },
     operator: operator as unknown as OperatorRepository,
     pingDatabase: vi.fn().mockResolvedValue(undefined),
     operatorToken: 'operator-secret',
@@ -82,9 +83,9 @@ describe('HTTP server', () => {
   });
 
   it('fails readiness when Linear access failed or the worker is stopping', async () => {
-    const linearDown = await serve({ scheduler: { isLive: () => true, status: () => status({ lastIntake: { at: new Date(), ok: false, error: 'Linear request failed: 401' } }) } });
+    const linearDown = await serve({ scheduler: { isLive: () => true, refreshControls: async () => undefined, status: () => status({ lastIntake: { at: new Date(), ok: false, error: 'Linear request failed: 401' } }) } });
     expect(await (await linearDown.request('/readyz')).json()).toMatchObject({ ready: false, checks: { linear: 'unavailable' } });
-    const stopping = await serve({ scheduler: { isLive: () => true, status: () => status({ stopping: true }) } });
+    const stopping = await serve({ scheduler: { isLive: () => true, refreshControls: async () => undefined, status: () => status({ stopping: true }) } });
     expect((await stopping.request('/readyz')).status).toBe(503);
   });
 
@@ -125,6 +126,32 @@ describe('HTTP server', () => {
     const cancelled = await request(`/operator/tasks/${taskId}/cancel`, { method: 'POST', token: 'operator-secret', body: context });
     expect(cancelled.status).toBe(409);
     expect((await request(`/operator/tasks/${taskId}`, { token: 'operator-secret' })).status).toBe(404);
+  });
+
+  it('engages the kill switch with an audited actor and reason and applies it to this worker immediately', async () => {
+    const refreshControls = vi.fn().mockResolvedValue(undefined);
+    const { operator, request } = await serve({ scheduler: { isLive: () => true, refreshControls, status: () => status() } });
+    const context = { actor: 'ops@example.test', reason: 'Runaway agent' };
+
+    expect((await request('/operator/kill-switch', { method: 'POST', token: 'operator-secret', body: context })).status).toBe(400);
+    expect((await request('/operator/kill-switch', { method: 'POST', body: { ...context, engaged: true } })).status).toBe(401);
+    expect(operator.setKillSwitch).not.toHaveBeenCalled();
+
+    const response = await request('/operator/kill-switch', { method: 'POST', token: 'operator-secret', body: { ...context, engaged: true } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ killSwitch: true });
+    expect(operator.setKillSwitch).toHaveBeenCalledWith(true, context);
+    expect(refreshControls).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves Prometheus metrics only when enabled', async () => {
+    const disabled = await serve();
+    expect((await disabled.request('/metrics')).status).toBe(404);
+    const enabled = await serve({ metrics: { render: async () => '# TYPE orchestrator_tasks gauge\norchestrator_tasks{state="QUEUED"} 2\n' } });
+    const response = await enabled.request('/metrics');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/plain; version=0.0.4');
+    expect(await response.text()).toContain('orchestrator_tasks{state="QUEUED"} 2');
   });
 
   it('rejects operator mutations in dry-run mode', async () => {
