@@ -8,6 +8,8 @@ export interface ResolvedProvider {
   environment: readonly string[];
   /** Provider-specific effort names, empty when the adapter's own map applies. */
   effort: Record<string, string>;
+  /** Operator-declared command line for `kind: cli`; absent for adapters that know their own protocol. */
+  cli?: OrchestratorConfig['models']['providers'][string]['cli'];
   /** True when the provider came from the pre-registry `agents.runner` block rather than `models.providers`. */
   legacy: boolean;
 }
@@ -25,6 +27,7 @@ export function effectiveProviders(config: OrchestratorConfig): ResolvedProvider
     executable: provider.executable,
     environment: provider.environment,
     effort: provider.effort,
+    ...(provider.cli === undefined ? {} : { cli: provider.cli }),
     legacy: false,
   }));
   if (declared.length > 0) return declared;

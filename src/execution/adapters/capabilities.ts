@@ -1,6 +1,9 @@
 import type { Effort } from '../../types/model.js';
 
-/** Confinement actually in force for the commands a model issues while it works on a task. */
+/**
+ * Confinement actually in force for the commands a model issues while it works on a task. It says nothing about the
+ * model client's own network access, which must stay open for it to reach its API.
+ */
 export type CommandConfinement = 'provider-sandbox' | 'bwrap' | 'none';
 
 /**
@@ -15,8 +18,10 @@ export interface AdapterCapabilities {
    */
   ownConfinement: 'provider-sandbox' | 'none';
   /**
-   * Whether the orchestrator may wrap this adapter in its own command sandbox. An adapter that already runs its own
-   * sandbox is not wrappable: nesting one sandbox inside another is unsupported and would silently weaken both.
+   * Whether the orchestrator may wrap this adapter's model process in its own command sandbox. An adapter that already
+   * runs its own sandbox is not wrappable: nesting one sandbox inside another is unsupported and would silently weaken
+   * both. A wrappable adapter is confined only when the orchestrator's command sandbox is active, so its effective
+   * confinement comes from `effectiveConfinement` and never from configuration.
    */
   wrappable: boolean;
   /** Provider-specific names for canonical effort levels. Providers may rename levels, never remove them. */
@@ -34,6 +39,18 @@ export const adapterCapabilities: Readonly<Record<string, AdapterCapabilities>> 
     ownConfinement: 'provider-sandbox',
     wrappable: false,
     effortMap: { max: 'xhigh' },
+  },
+  cli: {
+    // A declaratively configured command-line model client that brings no command sandbox of its own. Its confinement is
+    // derived, never declared: without the orchestrator's bubblewrap sandbox its effective confinement is `none`, so
+    // `writeRoles` cannot be served by it. An operator cannot assert `provider-sandbox` in configuration, because
+    // nothing in the orchestrator can verify such a claim; a self-sandboxing client belongs in its own adapter kind,
+    // where the guarantee sits next to the code that makes it true (as `codex-cli` does above).
+    ownConfinement: 'none',
+    wrappable: true,
+    // Effort names are the operator's to map through the provider's `effort` record, because every client names them
+    // differently and none of those names can be verified from here.
+    effortMap: {},
   },
 };
 

@@ -75,6 +75,43 @@ models:
   #     environment: [CODEX_HOME, OPENAI_API_KEY]
   #     effort: { max: xhigh }
   #
+  # `kind: cli` is the escape hatch for a model client that has no dedicated adapter: you describe its command line
+  # here and the orchestrator runs the real executable. The adapter substitutes these placeholders, and declares that
+  # every other placeholder is an error:
+  #
+  #   {model}         the resolved model name for the tier
+  #   {effort}        the effort level after this provider's `effort` mapping
+  #   {schema}        the result schema, as inline JSON
+  #   {schemaFile}    a path to the same schema, written for clients that take a file
+  #   {resultFile}    a path the client must write its JSON result to
+  #   {taskDirectory} the checked-out repository directory the run works in
+  #   {prompt}        the prompt itself, for clients that take it as an argument rather than on stdin
+  #
+  # The schema the orchestrator generates sets `additionalProperties: false` and lists every property in `required`, so
+  # the client validates structure strictly. It carries no `$schema` keyword, which every client tested accepts.
+  #
+  # A `cli` provider has no confinement of its own; it is wrapped by the orchestrator's command sandbox when
+  # `sandbox.kind` is set. Startup still refuses to serve a code-writing role from a provider that ends up unconfined.
+  # The wrapper keeps network access, because the client must reach its own API, so unlike `codex-cli` it cannot deny
+  # network to the commands the model itself issues. Prefer `codex-cli` when that distinction matters.
+  #
+  # Claude Code, as verified against its own `--help` output and a real run:
+  #
+  # claude:
+  #   kind: cli
+  #   executable: /usr/local/bin/claude
+  #   environment: [ANTHROPIC_API_KEY]
+  #   cli:
+  #     # `--json-schema` and `--no-session-persistence` are print mode only, which is why `--print` leads.
+  #     args: [--print, --output-format, json, --json-schema, "{schema}", --no-session-persistence, --model, "{model}", --effort, "{effort}"]
+  #     result: { source: stdout, path: structured_output }
+  #     # Claude Code exits 0 even when its own API call fails, so a clean exit only means "the client ran". It prints
+  #     # one envelope whose `is_error` is the only reliable signal: a real usage-limit run reported exit 0 together
+  #     # with is_error: true, api_error_status: 429, terminal_reason: api_error, subtype: success, and total_cost_usd: 0.
+  #     # Without this block the adapter would read that envelope as a result and retry a run that never happened.
+  #     failure: { path: is_error, values: ["true"], messagePath: result }
+  #     usage: { inputTokens: usage.input_tokens, cachedInputTokens: usage.cache_read_input_tokens, outputTokens: usage.output_tokens }
+  #
   # Routing is data too: `routes` overrides which tier and effort a complexity uses, `escalation` overrides the retry
   # ladder that a complexity walks on repeated failure, and `roles` pins one role to its own tier. Anything left out
   # keeps the documented default. Analyzer and reviewer always need a tier; implementer and fixer follow the escalation

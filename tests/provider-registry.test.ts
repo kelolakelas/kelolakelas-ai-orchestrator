@@ -8,6 +8,7 @@ import { effectiveProviders, providerAliasForTier, soleProvider, unconfiguredPro
 import { adapterCapabilitiesOf, effectiveConfinement, isAdapterKind, resolveEffortMap } from '../src/execution/adapters/capabilities.js';
 import { createProviderRegistry } from '../src/execution/provider-registry.js';
 import { DispatchingAgentRunner } from '../src/execution/dispatching-runner.js';
+import { NoSandbox, type CommandSandbox } from '../src/execution/sandbox.js';
 import { roleModel } from '../src/execution/stages/stage-support.js';
 import { escalationStep } from '../src/routing/escalation-policy.js';
 import { resolveRoute, selectModel } from '../src/routing/model-router.js';
@@ -171,15 +172,59 @@ describe('provider registry', () => {
     rmSync(scratch, { recursive: true, force: true });
   });
 
-  function registry(config: Parameters<typeof createProviderRegistry>[0]) {
+  function registry(config: Parameters<typeof createProviderRegistry>[0], sandbox: CommandSandbox = new NoSandbox()) {
     return createProviderRegistry(config, {
       scratchRoot: join(scratch, 'runner'),
       sourceEnvironment: { PATH: process.env.PATH },
+      sandbox,
       maxResultBytes: 64 * 1024,
       maxEventBytes: 1024 * 1024,
       knownSecrets: [],
     });
   }
+
+  /** One `cli` provider, whose confinement is the only kind that depends on the orchestrator's own sandbox. */
+  function cliConfig(sandbox: Record<string, unknown> = {}) {
+    return configWith(
+      {
+        providers: {
+          any: {
+            kind: 'cli',
+            executable: '/usr/local/bin/model-client',
+            cli: { args: ['--model', '{model}', '--schema', '{schema}', '--result', '{resultFile}'], result: { source: 'stdout', path: 'structured_output' } },
+          },
+        },
+      },
+      { sandbox },
+    );
+  }
+
+  it('derives a cli provider confinement from the orchestrator sandbox, never from configuration', () => {
+    // Confinement is a property of the configuration and its capability, so it never reads the injected instance.
+    const unwrapped = registry(cliConfig(), new NoSandbox());
+    const wrapped = registry(cliConfig({ kind: 'bubblewrap' }), new NoSandbox());
+    expect(unwrapped.handles[0]?.confinement).toBe('none');
+    expect(wrapped.handles[0]?.confinement).toBe('bwrap');
+    // Only the orchestrator's own configured sandbox confers confinement here; an operator cannot assert one.
+    expect(wrapped.handles[0]?.confinement).not.toBe('provider-sandbox');
+  });
+
+  it('refuses to serve a writing role from an unconfined cli provider, at configuration time', () => {
+    // `testConfig` leaves the command sandbox at `none`, so this provider confines nothing.
+    const provider = {
+      kind: 'cli',
+      executable: '/usr/local/bin/model-client',
+      cli: { args: ['--model', '{model}', '--schema', '{schema}', '--result', '{resultFile}'], result: { source: 'stdout', path: '' } },
+    };
+    // A role names a tier; the tier names the provider, which is why this is where the contract is enforced.
+    const routed = { providers: { any: provider }, tiers: { luna: { model: 'quick-model' }, terra: { model: 'balanced-model', provider: 'any' }, sol: { model: 'deep-model' } }, roles: { fixer: { tier: 'terra', effort: 'high' } } };
+    // The provider itself is fine and resolves to no confinement; it is the writing role that configuration refuses.
+    expect(registry(cliConfig()).handles[0]?.confinement).toBe('none');
+    expect(() => configWith(routed)).toThrow(/writes code, so provider any/);
+    // The same provider is accepted once the orchestrator's command sandbox can confine it.
+    const confined = configWith(routed, { sandbox: { kind: 'bubblewrap' } });
+    expect(confined.models.roles['fixer']?.tier).toBe('terra');
+  });
 
   it('builds one adapter per configured provider and dispatches a selection to its own provider', () => {
     const config = configWith({

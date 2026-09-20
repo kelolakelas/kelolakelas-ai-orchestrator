@@ -64,6 +64,7 @@ export class BubblewrapSandbox implements CommandSandbox {
       else if (this.exists(entry)) args.push('--ro-bind', entry, entry);
     }
     for (const path of [...this.config.readOnlyPaths, ...request.readOnlyPaths]) args.push('--ro-bind-try', path, path);
+    // Writable mounts come after read-only ones, so a writable path nested inside a read-only one still wins.
     for (const path of [...this.config.writablePaths, ...request.writablePaths]) args.push('--bind', path, path);
     // Masks come last so they cover a path inside any mounted parent. Only existing paths can be covered.
     for (const path of this.config.maskedPaths.filter((entry) => this.exists(entry))) args.push('--tmpfs', path);
