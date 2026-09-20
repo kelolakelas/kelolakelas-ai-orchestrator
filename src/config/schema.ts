@@ -2,6 +2,7 @@ import { isAbsolute } from 'node:path';
 import { DateTime } from 'luxon';
 import { z } from 'zod';
 import { adapterCapabilitiesOf, adapterKinds, effectiveConfinement, isAdapterKind, writeRoles } from '../execution/adapters/capabilities.js';
+import { cliPlaceholders, cliPlaceholdersIn } from '../execution/adapters/cli-contract.js';
 import { repositoryNames } from '../intake/planning-contract.js';
 import { effectiveProviders, providerAliasForTier } from './providers.js';
 import { defaultEscalation, defaultRouting } from '../routing/defaults.js';
@@ -66,8 +67,7 @@ const timeoutMinutes = z.number().int().positive().max(480);
 
 const agentsSchema = z.object({
   runner: z.object({
-    kind: z.enum(adapterKinds as [string, ...string[]]).default('codex-cli'),
-    /**
+    kind: z.enum(adapterKinds as [string, ...string[]]).default('codex-cli'),    /**
      * Absolute path of the runner executable; it is never resolved through PATH. Required only when this block is the
      * provider in force, which is the case while `models.providers` is empty. Once providers are declared this block is
      * deprecated for transport purposes, so the executable becomes optional and an operator can migrate fully.
@@ -207,6 +207,46 @@ const modelProviderSchema = z.object({
   environment: z.array(environmentName).default([]),
   /** Provider-specific names for canonical effort levels. A level may be renamed or given an alias, never removed. */
   effort: z.record(effortLevel, z.string().min(1)).default({}),
+  /** Transport for `kind: cli`. Required for that kind; ignored by adapters that know their own command line. */
+  cli: z.object({
+    /**
+     * Argument template, one array entry per argument. Exactly these are passed, followed by nothing else: the adapter
+     * never adds provider flags of its own, so the command line is entirely the operator's.
+     */
+    args: z.array(z.string()).min(1),
+    /** How the prompt reaches the client. `argument` requires a `{prompt}` placeholder in `args`. */
+    prompt: z.enum(['stdin', 'argument']).default('stdin'),
+    /**
+     * Where the client reports its result. `stdout` reads the process output, which is the whole document unless `path`
+     * names a nested field. `file` reads the file `{resultFile}` points at.
+     */
+    result: z.object({
+      source: z.enum(['stdout', 'file']).default('stdout'),
+      /** Dotted path of the result inside the parsed document. Empty means the document is the result. */
+      path: z.string().default(''),
+    }).strict().default({}),
+    /**
+     * Failure signal for a client that reports failure inside a successful exit. Some clients, Claude Code among them,
+     * exit 0 even when the run failed and describe the failure in their output instead. Without this declaration such a
+     * run is only detected as `invalid-output`, which loses usage-limit and rate-limit handling; declaring it lets the
+     * orchestrator pause instead of retrying into a limit.
+     */
+    failure: z.object({
+      /** Dotted path of the value that marks failure. */
+      path: z.string().min(1),
+      /** Values at that path that mean the run failed, compared case-insensitively. */
+      values: z.array(z.string().min(1)).min(1),
+      /** Dotted path of a human-readable message to report. Defaults to the value that marked the failure. */
+      messagePath: z.string().optional(),
+    }).strict().optional(),
+    /** Where token usage is read from the parsed document. Omitted usage is recorded as absent, never as zero. */
+    usage: z.object({
+      inputTokens: z.string().min(1),
+      cachedInputTokens: z.string().optional(),
+      outputTokens: z.string().min(1),
+      reasoningOutputTokens: z.string().optional(),
+    }).strict().optional(),
+  }).strict().optional(),
 }).strict();
 
 const modelTierSchema = z.object({
@@ -394,6 +434,19 @@ export const configSchema = z.object({
         message: 'is required when orchestrator.execution.runAgents is true and models.providers is empty',
       });
     }
+    /**
+     * The legacy block describes a provider executable but not a command line, and a `cli` provider cannot run without
+     * one. Rejecting it here is what keeps the shorthand from silently producing a provider that fails on first use.
+     * The test is on the declared providers rather than on `effectiveProviders`, because a legacy runner with an
+     * executable becomes a provider and would otherwise slip past this guard and fail only when the first run starts.
+     */
+    if (Object.keys(config.models.providers).length === 0 && config.agents?.runner.kind === 'cli') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['agents', 'runner', 'kind'],
+        message: "cannot be cli, because this block has no command line: declare the client under models.providers with a cli block instead",
+      });
+    }
     for (const tier of [...reachableTiers].filter((routed) => config.models.tiers[routed] === undefined)) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['models', 'tiers'], message: `must configure routed model tier ${tier} when orchestrator.execution.runAgents is true` });
     }
@@ -434,6 +487,74 @@ export const configSchema = z.object({
         code: z.ZodIssueCode.custom,
         path: ['models', 'providers', alias, 'kind'],
         message: `must be a known agent runner kind: ${adapterKinds.join(', ')}`,
+      });
+      continue;
+    }
+    const cli = provider.cli;
+    if (provider.kind !== 'cli') {
+      if (cli !== undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['models', 'providers', alias, 'cli'],
+          message: `is only used by the cli transport, and this provider uses kind ${provider.kind}, whose command line is fixed by its adapter`,
+        });
+      }
+      continue;
+    }
+    if (cli === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'providers', alias, 'cli'],
+        message: 'is required for kind cli, because only the operator knows how to invoke this model client',
+      });
+      continue;
+    }
+    /**
+     * The argument template is the operator's, so it is checked against the placeholders the adapter can substitute.
+     * An unknown placeholder would otherwise reach the client as a literal argument and fail there, far from its cause.
+     */
+    const known = new Set<string>(cliPlaceholders);
+    for (const [index, argument] of cli.args.entries()) {
+      for (const placeholder of cliPlaceholdersIn(argument)) {
+        if (known.has(placeholder)) continue;
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['models', 'providers', alias, 'cli', 'args', index],
+          message: `uses unknown placeholder ${placeholder}; supported placeholders are ${cliPlaceholders.join(', ')}`,
+        });
+      }
+    }
+    const args = cli.args.join(' ');
+    if (cli.prompt === 'argument' && !args.includes('{prompt}')) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'providers', alias, 'cli', 'prompt'],
+        message: 'is argument, so one args entry must contain the {prompt} placeholder',
+      });
+    }
+    if (cli.prompt === 'stdin' && args.includes('{prompt}')) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'providers', alias, 'cli', 'prompt'],
+        message: 'is stdin, so no args entry may contain the {prompt} placeholder',
+      });
+    }
+    if (cli.result.source === 'file' && !args.includes('{resultFile}')) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'providers', alias, 'cli', 'result', 'source'],
+        message: 'is file, so one args entry must contain the {resultFile} placeholder to tell the client where to write it',
+      });
+    }
+    /**
+     * A client is only asked to produce a schema-bound result if its command line says how. The result is read as JSON
+     * either way, but without a schema the client is free to answer in prose, which fails as invalid output.
+     */
+    if (!args.includes('{schema}') && !args.includes('{schemaFile}')) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'providers', alias, 'cli', 'args'],
+        message: 'must pass the result schema to the client, through the {schema} or {schemaFile} placeholder',
       });
     }
   }

@@ -11,6 +11,7 @@ import { DocumentationLoader } from '../src/execution/documentation.js';
 import { DispatchingAgentRunner } from '../src/execution/dispatching-runner.js';
 import { createProviderRegistry } from '../src/execution/provider-registry.js';
 import { QualityGateRunner } from '../src/execution/quality-gates.js';
+import { NoSandbox } from '../src/execution/sandbox.js';
 import { createExecutionHandlers } from '../src/execution/stages/index.js';
 import { reviewedLocalBranchReason } from '../src/execution/stages/review-stage.js';
 import { WorkspaceChanges } from '../src/execution/workspace-changes.js';
@@ -498,6 +499,7 @@ describeIntegration('supervised agent execution with PostgreSQL and Git', { time
       const providers = createProviderRegistry(orchestratorConfig, {
         scratchRoot: join(fixture.base, 'runner'),
         sourceEnvironment: process.env,
+        sandbox: new NoSandbox(),
         maxResultBytes: 256 * 1024,
         maxEventBytes: 4 * 1024 * 1024,
         knownSecrets: [],

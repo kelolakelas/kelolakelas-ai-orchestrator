@@ -116,14 +116,37 @@ A *provider* is an alias for an executable that runs a model. `models.providers.
 | `kind` | Own command confinement | Wrappable by `sandbox.kind: bubblewrap` |
 | --- | --- | --- |
 | `codex-cli` | yes (`codex exec --sandbox`) | no, bubblewrap cannot nest inside bubblewrap |
+| `cli` | no, the orchestrator's sandbox supplies it | yes, when `sandbox.kind` is `bubblewrap` |
 
-An adapter declares its own confinement because it is the only party that knows how it isolates model-issued commands. Configuration cannot widen a capability: the registry computes each provider's effective confinement from its adapter, and startup rejects any write-capable role (implementer or fixer) whose provider would leave commands unconfined. Adding a provider therefore means adding an adapter, not loosening a check.
+An adapter declares its own confinement because it is the only party that knows how it isolates model-issued commands. Configuration cannot widen a capability: the registry computes each provider's effective confinement from its adapter and the configured `sandbox.kind`, and startup rejects any write-capable role (implementer or fixer) whose provider would leave commands unconfined. A provider can never *claim* confinement, because only the sandbox the orchestrator itself builds and verifies can provide it. Adding a provider therefore means adding an adapter, or describing one with `cli`, not loosening a check.
 
 `models.providers.<alias>.environment` lists the extra variables that reach that provider's runs. Orchestrator credentials and every known provider credential are refused wherever repository quality commands could read them; a provider's own credential is expected, because that is how the provider authenticates.
 
 `models.providers.<alias>.effort` renames the canonical effort levels (`low`, `medium`, `high`, `max`) to whatever the provider calls them. Leaving it out uses the adapter's defaults; for `codex-cli` the default maps `max` to `xhigh`.
 
-`models.tiers.<tier>` pairs a free-form `model` name with the `provider` alias that serves it. With a single provider configured, no tier needs to name one and every tier uses it. With several, each reachable tier must name its provider or startup fails, so no attempt is routed by guesswork. `models.routes`, `models.escalation`, and `models.roles` likewise override the default complexity routes, retry ladders, and role assignments. The `agents.runner` block is deprecated: it still works, serves exactly one provider named after its `kind`, and logs a warning at startup. Declaring `models.providers` is what lets you go on to delete it, because `agents.runner.executable` is only required while that block is the provider in force.
+`models.tiers.<tier>` pairs a free-form `model` name with the `provider` alias that serves it. With a single provider configured, no tier needs to name one and every tier uses it. With several, each reachable tier must name its provider or startup fails, so no attempt is routed by guesswork. `models.routes`, `models.escalation`, and `models.roles` likewise override the default complexity routes, retry ladders, and role assignments. `models.roles.<role>` accepts only a tier and an effort; a role reaches a provider through the tier it names. The `agents.runner` block is deprecated: it still works, serves exactly one provider named after its `kind`, and logs a warning at startup. Declaring `models.providers` is what lets you go on to delete it, because `agents.runner.executable` is only required while that block is the provider in force.
+
+### Describing a model client with `kind: cli`
+
+`kind: cli` covers any model client that is not worth a dedicated adapter: the operator supplies the command line and the orchestrator runs the real executable. `models.providers.<alias>.cli.args` is an argument template, and a placeholder outside this list is rejected at startup, so a typo cannot reach the client as a literal argument:
+
+| Placeholder | Substituted with |
+| --- | --- |
+| `{model}` | the model name resolved for the tier |
+| `{effort}` | the effort level after this provider's `effort` mapping |
+| `{schema}` | the result schema as inline JSON |
+| `{schemaFile}` | a path to the same schema, for clients that take a file |
+| `{resultFile}` | a path the client must write its JSON result to |
+| `{taskDirectory}` | the checked-out repository directory the run works in |
+| `{prompt}` | the prompt itself, for clients that take it as an argument |
+
+`cli.prompt` is `stdin` (the default) or `argument`, and `cli.result.source` is `stdout` or `file`. `cli.result.path` is a dotted path into whatever the client prints, so a result nested inside an envelope needs no code. `cli.usage` names the same kind of path for token counts.
+
+A client's exit code is a claim, not a fact. `cli.failure` declares the path, the values, and optionally the message path that mark a run as failed *despite* a clean exit. This is not hypothetical: Claude Code exits 0 when its own API call fails, so a run that hit a usage limit returned exit 0 alongside `is_error: true`, `api_error_status: 429`, `terminal_reason: "api_error"`, `subtype: "success"`, and `total_cost_usd: 0`. A provider that reports failures this way and omits `cli.failure` would have that envelope read as a result. Declared failures are classified the same way native adapter failures are, so a usage limit still pauses the task instead of burning retries.
+
+A `cli` provider is wrapped by the orchestrator's own command sandbox, the same instance startup verifies with `verifySandbox`. The task directory is mounted writable for implementer and fixer and read-only for analyzer and reviewer, and writable mounts win over read-only ones. The wrapper **keeps network access**, because the client has to reach its own API; unlike `codex-cli`, which denies network to the commands the model itself issues, a wrapped client keeps it. That is a real residual difference between the two kinds and the reason `codex-cli` remains the better choice when the model's own subprocesses must not reach the network.
+
+The schema handed to a client sets `additionalProperties: false` and lists every property in `required`. It carries no `$schema` keyword, which is accepted verbatim; an explicit draft 2020-12 URI is rejected by Claude Code, so a client that needs a dialect declared should be verified before it is trusted in configuration.
 
 ## Planning intake contract
 

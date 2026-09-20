@@ -119,6 +119,8 @@ async function main(): Promise<void> {
         // Inside the workspace root but outside every task directory, so no agent can write run files.
         scratchRoot: join(registry.workspaceRoot, '.runner'),
         sourceEnvironment: process.env,
+        // A `cli` provider is confined only by this sandbox, which has already passed its startup check.
+        sandbox,
         maxResultBytes: agents.runner.maxResultBytes,
         maxEventBytes: agents.runner.maxEventBytes,
         knownSecrets,
