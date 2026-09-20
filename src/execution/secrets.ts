@@ -1,18 +1,22 @@
+import { providerCredentialPatterns } from '../security/credentials.js';
+
 export interface SecretRule {
   rule: string;
   pattern: RegExp;
 }
 
-/** Credential formats that must never be committed or persisted as evidence. */
+/**
+ * Credential formats that must never be committed or persisted as evidence. Provider token shapes come from
+ * `security/credentials.ts`, so a provider added there is redacted here without a second edit.
+ */
 export const secretRules: readonly SecretRule[] = [
   { rule: 'private-key', pattern: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/ },
   { rule: 'aws-access-key-id', pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/ },
   { rule: 'github-token', pattern: /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})\b/ },
-  { rule: 'openai-api-key', pattern: /\bsk-(?:proj-|svcacct-|ant-)?[A-Za-z0-9_-]{32,}\b/ },
   { rule: 'linear-api-key', pattern: /\blin_(?:api|oauth)_[A-Za-z0-9]{32,}\b/ },
   { rule: 'slack-token', pattern: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/ },
-  { rule: 'google-api-key', pattern: /\bAIza[0-9A-Za-z_-]{35}\b/ },
   { rule: 'stripe-live-key', pattern: /\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b/ },
+  ...providerCredentialPatterns,
   { rule: 'credential-assignment', pattern: /(?:api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["'][A-Za-z0-9+/=_-]{24,}["']/i },
 ];
 

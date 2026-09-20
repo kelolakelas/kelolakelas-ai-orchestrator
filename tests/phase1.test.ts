@@ -88,18 +88,21 @@ describe('structured logging', () => {
 });
 
 describe('model policy', () => {
+  // This configuration routes without running agents, so no provider is in force and routing records that fact.
+  const unrouted = { provider: 'unconfigured' };
+
   it('maps every complexity deterministically to its initial model selection', () => {
-    expect(selectModel(config, 'very-low')).toEqual({ tier: 'luna', model: 'luna-model', effort: 'medium' });
-    expect(selectModel(config, 'low')).toEqual({ tier: 'luna', model: 'luna-model', effort: 'high' });
-    expect(selectModel(config, 'medium')).toEqual({ tier: 'terra', model: 'terra-model', effort: 'medium' });
-    expect(selectModel(config, 'high')).toEqual({ tier: 'terra', model: 'terra-model', effort: 'high' });
-    expect(selectModel(config, 'very-high')).toEqual({ tier: 'sol', model: 'sol-model', effort: 'medium' });
-    expect(selectModel(config, 'critical')).toEqual({ tier: 'sol', model: 'sol-model', effort: 'high' });
+    expect(selectModel(config, 'very-low')).toEqual({ ...unrouted, tier: 'luna', model: 'luna-model', effort: 'medium' });
+    expect(selectModel(config, 'low')).toEqual({ ...unrouted, tier: 'luna', model: 'luna-model', effort: 'high' });
+    expect(selectModel(config, 'medium')).toEqual({ ...unrouted, tier: 'terra', model: 'terra-model', effort: 'medium' });
+    expect(selectModel(config, 'high')).toEqual({ ...unrouted, tier: 'terra', model: 'terra-model', effort: 'high' });
+    expect(selectModel(config, 'very-high')).toEqual({ ...unrouted, tier: 'sol', model: 'sol-model', effort: 'medium' });
+    expect(selectModel(config, 'critical')).toEqual({ ...unrouted, tier: 'sol', model: 'sol-model', effort: 'high' });
   });
 
   it('starts with selectModel and allows max effort only on a retry', () => {
     expect(escalationStep(config, 'critical', 1)).toEqual(selectModel(config, 'critical'));
-    expect(escalationStep(config, 'critical', 2)).toEqual({ tier: 'sol', model: 'sol-model', effort: 'max' });
+    expect(escalationStep(config, 'critical', 2)).toEqual({ ...unrouted, tier: 'sol', model: 'sol-model', effort: 'max' });
     expect(escalationStep(config, 'medium', 3)).toBeUndefined();
     expect(escalationStep(config, 'medium', 0)).toBeUndefined();
   });

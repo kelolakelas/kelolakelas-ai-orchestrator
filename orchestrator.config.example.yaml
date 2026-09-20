@@ -58,6 +58,35 @@ models:
     luna: { model: configurable-luna-model }
     terra: { model: configurable-terra-model }
     sol: { model: configurable-sol-model }
+  # Which executable runs a model, addressed by alias. A model name is free-form, so any provider works as long as an
+  # adapter exists for its `kind`; capabilities come from the adapter, never from this file.
+  #
+  # With a single provider configured, every tier uses it and no tier needs to name one. With several, each reachable
+  # tier must name its provider, so no attempt is ever routed by guesswork. `environment` lists the extra variables that
+  # reach that provider only; orchestrator credentials (DATABASE_URL, LINEAR_API_KEY, operator token) are always refused.
+  #
+  # `effort` renames the canonical levels (low, medium, high, max) to whatever the provider calls them. Leaving it out
+  # uses the adapter's own defaults.
+  #
+  # providers:
+  #   codex:
+  #     kind: codex-cli
+  #     executable: /usr/local/bin/codex
+  #     environment: [CODEX_HOME, OPENAI_API_KEY]
+  #     effort: { max: xhigh }
+  #
+  # Routing is data too: `routes` overrides which tier and effort a complexity uses, `escalation` overrides the retry
+  # ladder that a complexity walks on repeated failure, and `roles` pins one role to its own tier. Anything left out
+  # keeps the documented default. Analyzer and reviewer always need a tier; implementer and fixer follow the escalation
+  # ladder unless `roles` pins them.
+  #
+  # routes:
+  #   medium: { tier: terra, effort: high }
+  # escalation:
+  #   medium: [{ tier: terra, effort: medium }, { tier: sol, effort: high }]
+  # roles:
+  #   implementer: { tier: terra, effort: high }
+  #   fixer: { tier: sol, effort: high }
 limits:
   maxImplementationAttempts: 4
   maxQualityFixAttempts: 3
@@ -102,6 +131,8 @@ limits:
 #   identity: { path: /srv/kelolakelas/kelolakelas-identity-service, github: kelolakelas/kelolakelas-identity-service, quality: *go-quality }
 #   billing: { path: /srv/kelolakelas/kelolakelas-billing-service, github: kelolakelas/kelolakelas-billing-service, quality: *go-quality }
 # Required when runAgents is true. Every routed model tier (luna, terra, sol) must be configured under models.tiers.
+# Deprecated in favour of models.providers: this block still works and supplies a single provider named after its `kind`,
+# but it cannot describe more than one provider. Listing every routed provider in models.providers is preferred.
 # agents:
 #   runner:
 #     kind: codex-cli

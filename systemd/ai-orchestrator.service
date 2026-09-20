@@ -10,7 +10,7 @@ Group=ai-orchestrator
 WorkingDirectory=/opt/ai-orchestrator
 # Owned by root with mode 0600. systemd reads it before dropping privileges, so neither the service user nor any agent
 # or quality command can read the file. The values reach only the orchestrator's environment, which the command sandbox
-# and the Codex sandbox hide from the processes they start.
+# and each provider's own command sandbox hide from the processes they start.
 EnvironmentFile=/etc/ai-orchestrator/orchestrator.env
 Environment=ORCHESTRATOR_CONFIG=/etc/ai-orchestrator/orchestrator.yaml
 # Stable per-host identity so a restart recovers leases held by the previous process. Run one instance per host.

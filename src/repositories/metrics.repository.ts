@@ -8,7 +8,7 @@ export interface OperationalSnapshot {
   manualIntervention: number;
   quarantined: number;
   attempts: Array<{ stage: TaskState; category: string; attempts: number }>;
-  tokens: Array<{ model: string; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number }>;
+  tokens: Array<{ model: string; provider: string; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number }>;
   workUnitsAwaitingMerge: number;
 }
 
@@ -36,13 +36,14 @@ export class MetricsRepository {
       select stage, coalesce(failure_category, case when completed_at is null then 'in_progress' else 'succeeded' end) as category,
         count(*) as attempts
       from task_attempts group by 1, 2`);
-    const tokens = await this.db.execute<{ model: string; input: string; cached: string; output: string; reasoning: string }>(sql`
+    const tokens = await this.db.execute<{ model: string; provider: string; input: string; cached: string; output: string; reasoning: string }>(sql`
       select coalesce(input -> 'model' ->> 'model', 'unknown') as model,
+        coalesce(input -> 'model' ->> 'provider', 'unknown') as provider,
         sum(coalesce((usage ->> 'inputTokens')::numeric, 0)) as input,
         sum(coalesce((usage ->> 'cachedInputTokens')::numeric, 0)) as cached,
         sum(coalesce((usage ->> 'outputTokens')::numeric, 0)) as output,
         sum(coalesce((usage ->> 'reasoningOutputTokens')::numeric, 0)) as reasoning
-      from task_attempts where usage is not null group by 1`);
+      from task_attempts where usage is not null group by 1, 2`);
     const awaitingMerge = await this.db.execute<{ total: string }>(sql`
       select count(*) as total from task_work_units wu join tasks t on t.id = wu.task_id
       where wu.pull_request_number is not null and wu.merge_commit is null and t.state in ('PR_CREATED', 'WAITING_CI', 'READY_FOR_HUMAN_REVIEW')`);
@@ -55,6 +56,7 @@ export class MetricsRepository {
       attempts: attempts.rows.map((row) => ({ stage: row.stage, category: row.category, attempts: num(row.attempts) })),
       tokens: tokens.rows.map((row) => ({
         model: row.model,
+        provider: row.provider,
         inputTokens: num(row.input),
         cachedInputTokens: num(row.cached),
         outputTokens: num(row.output),

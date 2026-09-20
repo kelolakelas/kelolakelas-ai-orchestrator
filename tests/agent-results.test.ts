@@ -12,7 +12,7 @@ function reviewResult(overrides: Partial<ReviewResult> = {}): ReviewResult {
 describe('agent result schemas', () => {
   it('accepts a valid versioned analysis and rejects fields that could select a command, tool, or model', () => {
     expect(analysisResultSchema.parse(analysisResult())).toMatchObject({ decision: 'proceed' });
-    expect(analysisResultSchema.safeParse({ ...analysisResult(), model: 'gpt-x' }).success).toBe(false);
+    expect(analysisResultSchema.safeParse({ ...analysisResult(), model: 'other-model' }).success).toBe(false);
     expect(analysisResultSchema.safeParse({ ...analysisResult(), commands: ['rm -rf /'] }).success).toBe(false);
     expect(analysisResultSchema.safeParse({ ...analysisResult(), schemaVersion: 'kelolakelas.agent.analysis/v0' }).success).toBe(false);
     const withTool = analysisResult();

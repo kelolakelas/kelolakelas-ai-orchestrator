@@ -4,10 +4,12 @@ import { access, constants, realpath } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from './config/config.js';
+import { effectiveProviders } from './config/providers.js';
 import { createDatabase } from './db/client.js';
-import { CodexCliRunner } from './execution/agent-runner.js';
+import { DispatchingAgentRunner } from './execution/dispatching-runner.js';
 import { runBoundedProcess } from './execution/bounded-process.js';
 import { DocumentationLoader } from './execution/documentation.js';
+import { createProviderRegistry } from './execution/provider-registry.js';
 import { QualityGateRunner } from './execution/quality-gates.js';
 import { createSandbox, verifySandbox } from './execution/sandbox.js';
 import { collectKnownSecrets } from './execution/secrets.js';
@@ -47,6 +49,14 @@ async function main(): Promise<void> {
   const configuredWorkerId = process.env.ORCHESTRATOR_WORKER_ID;
   const workerId = configuredWorkerId ?? `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
   const log = (event: string, fields: Record<string, unknown> = {}) => logger.info({ ...fields, event }, event);
+
+  // The pre-registry `agents.runner` block still works, but every provider it serves is now recorded by alias, so an
+  // operator migrating to `models.providers` can see exactly which provider each task ran on.
+  for (const provider of effectiveProviders(config)) {
+    if (provider.legacy) {
+      logger.warn({ event: 'legacy_runner_configuration', provider: provider.alias, kind: provider.kind }, `agents.runner is deprecated; declare models.providers.${provider.alias} instead`);
+    }
+  }
 
   const githubToken = process.env.GITHUB_TOKEN;
   if (config.orchestrator.execution.deliver && !githubToken) throw new Error('GITHUB_TOKEN is required when orchestrator.execution.deliver is true');
@@ -102,12 +112,23 @@ async function main(): Promise<void> {
     const preparation = { workerId, remoteRetryMs: config.workspace.remoteRetryMinutes * 60_000 };
     if (config.orchestrator.execution.runAgents && config.agents !== undefined) {
       const agents = config.agents;
-      await access(agents.runner.executable, constants.X_OK).catch(() => {
-        throw new Error(`Agent runner executable is not executable: ${agents.runner.executable}`);
-      });
       const knownSecrets = collectKnownSecrets(process.env);
       const sandbox = createSandbox(config.sandbox);
       await verifySandbox(sandbox, runBoundedProcess);
+      const providers = createProviderRegistry(config, {
+        // Inside the workspace root but outside every task directory, so no agent can write run files.
+        scratchRoot: join(registry.workspaceRoot, '.runner'),
+        sourceEnvironment: process.env,
+        maxResultBytes: agents.runner.maxResultBytes,
+        maxEventBytes: agents.runner.maxEventBytes,
+        knownSecrets,
+      });
+      // Fail closed on every provider this configuration routes to, not only the legacy single runner.
+      for (const provider of providers.handles) {
+        await access(provider.executable, constants.X_OK).catch(() => {
+          throw new Error(`Agent runner executable for provider ${provider.alias} (${provider.kind}) is not executable: ${provider.executable}`);
+        });
+      }
       const execution: ExecutionDependencies = {
         config,
         agents,
@@ -115,16 +136,7 @@ async function main(): Promise<void> {
         registry,
         workspaces,
         changes: new WorkspaceChanges(git),
-        runner: new CodexCliRunner({
-          executable: agents.runner.executable,
-          // Inside the workspace root but outside every task directory, so no agent can write run files.
-          scratchRoot: join(registry.workspaceRoot, '.runner'),
-          sourceEnvironment: process.env,
-          extraEnvironment: agents.runner.environment,
-          maxResultBytes: agents.runner.maxResultBytes,
-          maxEventBytes: agents.runner.maxEventBytes,
-          knownSecrets,
-        }),
+        runner: new DispatchingAgentRunner(providers),
         quality: new QualityGateRunner({
           quality: (repository) => {
             const entry = config.repositories[registry.get(repository).name];

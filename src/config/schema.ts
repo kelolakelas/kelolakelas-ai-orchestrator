@@ -1,8 +1,15 @@
 import { isAbsolute } from 'node:path';
 import { DateTime } from 'luxon';
 import { z } from 'zod';
+import { adapterCapabilitiesOf, adapterKinds, effectiveConfinement, isAdapterKind, writeRoles } from '../execution/adapters/capabilities.js';
 import { repositoryNames } from '../intake/planning-contract.js';
-import { routedModelTiers } from '../routing/escalation-policy.js';
+import { effectiveProviders, providerAliasForTier } from './providers.js';
+import { defaultEscalation, defaultRouting } from '../routing/defaults.js';
+import { providerCredentialEnvironment, withheldEnvironment } from '../security/credentials.js';
+import { complexityValues } from '../types/complexity.js';
+import { agentRoleValues, effortValues } from '../types/model.js';
+
+export { providerCredentialEnvironment, withheldEnvironment } from '../security/credentials.js';
 
 const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
 const windowSchema = z.object({
@@ -15,9 +22,6 @@ const gitRefComponent = z.string().regex(/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*
 
 const environmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'must be an environment variable name');
 const relativeFilePath = z.string().min(1).refine((value) => !isAbsolute(value) && !value.split(/[\\/]/).includes('..'), 'must be a relative path without ..');
-
-/** Orchestrator credentials that must never reach an agent or a repository command. */
-export const withheldEnvironment = ['DATABASE_URL', 'LINEAR_API_KEY', 'ORCHESTRATOR_OPERATOR_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN'] as const;
 
 /**
  * A trusted repository command. Commands are argument arrays from operator configuration and are addressed by name;
@@ -62,10 +66,14 @@ const timeoutMinutes = z.number().int().positive().max(480);
 
 const agentsSchema = z.object({
   runner: z.object({
-    kind: z.literal('codex-cli').default('codex-cli'),
-    /** Absolute path of the runner executable; it is never resolved through PATH. */
-    executable: absolutePath,
-    /** Extra environment variable names passed to the runner process, such as `CODEX_HOME` or `OPENAI_API_KEY`. */
+    kind: z.enum(adapterKinds as [string, ...string[]]).default('codex-cli'),
+    /**
+     * Absolute path of the runner executable; it is never resolved through PATH. Required only when this block is the
+     * provider in force, which is the case while `models.providers` is empty. Once providers are declared this block is
+     * deprecated for transport purposes, so the executable becomes optional and an operator can migrate fully.
+     */
+    executable: absolutePath.optional(),
+    /** Extra environment variable names passed to the runner process, such as its credential or configuration variables. */
     environment: z.array(environmentName).default([]),
     timeoutMinutes: z.object({
       analysis: timeoutMinutes.default(20),
@@ -184,6 +192,31 @@ const modelPriceSchema = z.object({
   outputPerMillionTokens: z.number().nonnegative(),
 }).strict();
 
+const effortLevel = z.enum(effortValues);
+const providerAlias = z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'must be a lowercase provider alias');
+
+/**
+ * One executable that runs models, addressed by alias so tiers can route to it. The `kind` selects the adapter, which is
+ * the only place provider-specific behaviour lives; everything configurable here is passed to that adapter.
+ */
+const modelProviderSchema = z.object({
+  kind: z.string().min(1),
+  /** Absolute path of the provider executable; it is never resolved through PATH. */
+  executable: absolutePath,
+  /** Extra environment variable names passed to the provider process, such as its credential or configuration variables. */
+  environment: z.array(environmentName).default([]),
+  /** Provider-specific names for canonical effort levels. A level may be renamed or given an alias, never removed. */
+  effort: z.record(effortLevel, z.string().min(1)).default({}),
+}).strict();
+
+const modelTierSchema = z.object({
+  model: z.string().min(1),
+  /** Provider alias serving this tier. Optional only while exactly one provider is configured. */
+  provider: providerAlias.optional(),
+}).strict();
+
+const modelRoleSchema = z.object({ tier: z.string().min(1), effort: effortLevel });
+
 export const configSchema = z.object({
   timezone: z.string().min(1),
   orchestrator: z.object({
@@ -281,9 +314,23 @@ export const configSchema = z.object({
     maxRetries: z.number().int().nonnegative().max(5).default(3),
   }),
   models: z.object({
-    tiers: z.record(z.object({ model: z.string().min(1) })),
-    analyzer: z.object({ tier: z.string().min(1), effort: z.enum(['low', 'medium', 'high', 'max']) }),
-    reviewer: z.object({ tier: z.string().min(1), effort: z.enum(['low', 'medium', 'high', 'max']) }),
+    /** Providers by alias. A tier names the provider that serves it, so routing is configuration rather than code. */
+    providers: z.record(providerAlias, modelProviderSchema).default({}),
+    tiers: z.record(z.string().min(1), modelTierSchema),
+    /**
+     * Routing override by complexity. Unset complexities keep the built-in default ladder, so a configuration that does
+     * not mention routing behaves exactly as before.
+     */
+    routes: z.record(z.enum(complexityValues), z.object({ tier: z.string().min(1), effort: effortLevel }).strict()).default({}),
+    /**
+     * Escalation ladders by complexity, replacing the built-in ladder per complexity. Each rung is tried in order as
+     * implementation attempts advance, and the attempt beyond the last rung fails. Unset complexities keep the default.
+     */
+    escalation: z.record(z.enum(complexityValues), z.array(z.object({ tier: z.string().min(1), effort: effortLevel }).strict()).min(1)).default({}),
+    /** Per-role pinning. This is what assigns a role to a provider, and capabilities are checked against it. */
+    roles: z.record(z.enum(agentRoleValues), z.object({ tier: z.string().min(1), effort: effortLevel }).strict()).default({}),
+    analyzer: modelRoleSchema,
+    reviewer: modelRoleSchema,
   }),
   limits: z.object({
     maxImplementationAttempts: z.number().int().positive().default(4),
@@ -316,6 +363,22 @@ export const configSchema = z.object({
     }
   }
 
+  /**
+   * Every tier routing can reach, whatever its source: configured routes and escalation ladders, plus the built-in
+   * default for each complexity the configuration does not override, plus per-role pinning. Validation proves each one
+   * is configured and unambiguous, so no attempt can fail on an unconfigured tier at run time.
+   */
+  const reachableTiers = new Set([
+    ...complexityValues.flatMap((complexity) => {
+      const ladder = config.models.escalation[complexity] ?? defaultEscalation[complexity];
+      const route = config.models.routes[complexity] ?? defaultRouting[complexity];
+      return [route.tier, ...ladder.map((step) => step.tier)];
+    }),
+    config.models.analyzer.tier,
+    config.models.reviewer.tier,
+    ...Object.values(config.models.roles).map((role) => role.tier),
+  ]);
+
   if (config.orchestrator.execution.runAgents) {
     if (!config.orchestrator.execution.prepareWorkspaces) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['orchestrator', 'execution', 'prepareWorkspaces'], message: 'must be true when orchestrator.execution.runAgents is true' });
@@ -323,7 +386,15 @@ export const configSchema = z.object({
     if (config.agents === undefined) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['agents'], message: 'is required when orchestrator.execution.runAgents is true' });
     }
-    for (const tier of routedModelTiers.filter((routed) => config.models.tiers[routed] === undefined)) {
+    if (config.agents?.runner.executable === undefined && effectiveProviders(config).length === 0) {
+      // Running agents needs a transport: either declared providers, or a legacy runner executable to become one.
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['agents', 'runner', 'executable'],
+        message: 'is required when orchestrator.execution.runAgents is true and models.providers is empty',
+      });
+    }
+    for (const tier of [...reachableTiers].filter((routed) => config.models.tiers[routed] === undefined)) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['models', 'tiers'], message: `must configure routed model tier ${tier} when orchestrator.execution.runAgents is true` });
     }
     for (const [name, repository] of Object.entries(config.repositories)) {
@@ -357,13 +428,80 @@ export const configSchema = z.object({
     }
   }
 
+  for (const [alias, provider] of Object.entries(config.models.providers)) {
+    if (!isAdapterKind(provider.kind)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'providers', alias, 'kind'],
+        message: `must be a known agent runner kind: ${adapterKinds.join(', ')}`,
+      });
+    }
+  }
+
+  /**
+   * Routing must be unambiguous. When more than one provider is configured, every reachable tier has to say which one it
+   * uses, so no attempt is ever routed by guesswork or by provider ordering.
+   */
+  if (Object.keys(config.models.providers).length > 1) {
+    const aliases = Object.keys(config.models.providers).join(', ');
+    for (const tier of reachableTiers) {
+      if (config.models.tiers[tier] === undefined) continue;
+      if (config.models.tiers[tier]?.provider !== undefined) continue;
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'tiers', tier, 'provider'],
+        message: `must name a provider because more than one provider is configured (${aliases})`,
+      });
+    }
+  }
+
+  /**
+   * The capability contract. A provider's adapter declares what it can confine; configuration cannot widen it, and every
+   * role that writes code must be served by a provider that confines the commands the model issues. This is fail-closed:
+   * an unconfined provider assigned to a write role is a configuration error, never a runtime warning.
+   */
+  const declaredProviders = effectiveProviders(config).map((provider) => ({
+    alias: provider.alias,
+    kind: provider.kind,
+    confinement: isAdapterKind(provider.kind) ? effectiveConfinement(adapterCapabilitiesOf(provider.kind), config.sandbox.kind) : 'none',
+  }));
+  const roleAssignments: Array<{ path: string[]; role: string; tier: string }> = [
+    { path: ['models', 'analyzer', 'tier'], role: 'analyzer', tier: config.models.analyzer.tier },
+    { path: ['models', 'reviewer', 'tier'], role: 'reviewer', tier: config.models.reviewer.tier },
+    ...Object.entries(config.models.roles).map(([role, assignment]) => ({ path: ['models', 'roles', role, 'tier'], role, tier: assignment.tier })),
+  ];
+  for (const assignment of roleAssignments) {
+    if (config.models.tiers[assignment.tier] === undefined) continue;
+    if (!writeRoles.includes(assignment.role)) continue;
+    const alias = providerAliasForTier(config, assignment.tier);
+    if (alias === undefined) {
+      // Ambiguity is already reported against the tier; reporting it again per role would only add noise.
+      continue;
+    }
+    const provider = declaredProviders.find((candidate) => candidate.alias === alias);
+    if (provider === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: assignment.path,
+        message: `must reference a configured provider alias: ${alias}`,
+      });
+      continue;
+    }
+    if (provider.confinement !== 'none') continue;
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: assignment.path,
+      message: `stage ${assignment.role} writes code, so provider ${provider.alias} (kind ${provider.kind}) must confine commands: use a provider with a command sandbox, or one the bubblewrap command sandbox can wrap`,
+    });
+  }
+
   const exposures: Array<{ path: string[]; names: readonly string[]; withheld: readonly string[] }> = [
     { path: ['agents', 'runner', 'environment'], names: config.agents?.runner.environment ?? [], withheld: withheldEnvironment },
     // Repository commands execute model-written code, so they never receive model credentials either.
     ...Object.entries(config.repositories).map(([name, repository]) => ({
       path: ['repositories', name, 'quality', 'environment'],
       names: repository.quality.environment,
-      withheld: [...withheldEnvironment, 'OPENAI_API_KEY', 'CODEX_API_KEY'],
+      withheld: [...withheldEnvironment, ...providerCredentialEnvironment],
     })),
   ];
   for (const exposure of exposures) {
@@ -379,6 +517,24 @@ export const configSchema = z.object({
         code: z.ZodIssueCode.custom,
         path: ['models', role, 'tier'],
         message: `must reference a configured model tier: ${tier}`,
+      });
+    }
+  }
+  for (const [role, assignment] of Object.entries(config.models.roles)) {
+    if (config.models.tiers[assignment.tier] === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'roles', role, 'tier'],
+        message: `must reference a configured model tier: ${assignment.tier}`,
+      });
+    }
+  }
+  for (const [name, tier] of Object.entries(config.models.tiers)) {
+    if (tier.provider !== undefined && !Object.hasOwn(config.models.providers, tier.provider)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['models', 'tiers', name, 'provider'],
+        message: `must reference a configured provider alias: ${tier.provider}`,
       });
     }
   }

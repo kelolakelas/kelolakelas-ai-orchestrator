@@ -4,7 +4,7 @@ import type { AgentsConfig, OrchestratorConfig } from '../../config/schema.js';
 import { validatePlanningIssue, type PlanningIssue } from '../../intake/planning-contract.js';
 import type { StageContext, StageOutcome } from '../../orchestrator/stage-handler.js';
 import { stableJson, type PersistedTask, type TaskRepository } from '../../repositories/task.repository.js';
-import type { ModelSelection } from '../../routing/model-router.js';
+import { resolveRoute, type ModelSelection } from '../../routing/model-router.js';
 import type { TaskState } from '../../types/domain.js';
 import type { RepositoryName, RepositoryRegistry } from '../../workspaces/repository-registry.js';
 import { WorkspaceBlockedError } from '../../workspaces/repository-registry.js';
@@ -171,7 +171,7 @@ export function pauseOrInterruption(deps: ExecutionDependencies, result: AgentRu
     case 'usage-limit':
       return {
         category: 'usage-limit',
-        outcome: { kind: 'pause-limit', pauseReason: 'CODEX_USAGE_LIMIT', reason: result.message, ...(result.retryAfter === null ? {} : { resumeAfter: result.retryAfter }) },
+        outcome: { kind: 'pause-limit', pauseReason: 'USAGE_LIMIT', reason: result.message, ...(result.retryAfter === null ? {} : { resumeAfter: result.retryAfter }) },
       };
     case 'rate-limit':
       return {
@@ -221,8 +221,21 @@ export async function completeAttempt(
   });
 }
 
+/**
+ * The routed model recorded as attempt evidence. Provider and tier are both recorded so any attempt can be reproduced
+ * from configuration alone, whichever provider served it.
+ */
 export function modelInput(model: ModelSelection): Record<string, unknown> {
-  return { tier: model.tier, model: model.model, effort: model.effort };
+  return { provider: model.provider, tier: model.tier, model: model.model, effort: model.effort };
+}
+
+/**
+ * Model for a pinned role. `models.roles.<role>` wins when configured, otherwise the role's own block (analyzer and
+ * reviewer) supplies tier and effort. Resolution is against configuration, never against stored or model-supplied data.
+ */
+export function roleModel(config: OrchestratorConfig, role: 'analyzer' | 'reviewer'): ModelSelection {
+  const pinned = config.models.roles[role] ?? config.models[role];
+  return resolveRoute(config, pinned);
 }
 
 export async function requireAnalysis(context: StageContext): Promise<AnalysisResult> {

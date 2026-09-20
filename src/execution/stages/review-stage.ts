@@ -3,7 +3,7 @@ import { effectiveVerdict, reviewProblems, reviewResultSchema } from '../agent-r
 import { buildReviewPrompt, promptDigest, promptTemplateVersion } from '../prompts.js';
 import {
   checkpointKeys, completeAttempt, failureCategoryOf, loadTaskWorkspaces, manualIntervention, modelInput, pauseOrInterruption,
-  qualityPassedSchema, readCheckpoint, requireAnalysis, reviewApprovedSchema, sameHeads, startAttempt, workspaceSnapshots,
+  qualityPassedSchema, readCheckpoint, requireAnalysis, reviewApprovedSchema, roleModel, sameHeads, startAttempt, workspaceSnapshots,
   type ExecutionDependencies,
 } from './stage-support.js';
 
@@ -42,8 +42,7 @@ export class ReviewStage implements StageHandler {
       diffs.push({ repository: unit.repository, ...await deps.changes.diffFromBase(unit.workspacePath, unit.baseCommit, deps.agents.maxReviewDiffBytes) });
     }
     const prompt = buildReviewPrompt({ contract: loaded.contract, workspaces: loaded.prompt, plan, diffs });
-    const tier = deps.config.models.reviewer.tier;
-    const model = { tier, model: deps.config.models.tiers[tier]?.model ?? '', effort: deps.config.models.reviewer.effort };
+    const model = roleModel(deps.config, 'reviewer');
     const scope = await startAttempt(deps, task, {
       promptTemplateVersion, ...promptDigest(prompt), model: modelInput(model), heads: loaded.heads,
       diffs: diffs.map(({ repository, truncated }) => ({ repository, truncated })),

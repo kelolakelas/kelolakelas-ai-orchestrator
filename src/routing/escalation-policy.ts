@@ -1,25 +1,20 @@
 import type { OrchestratorConfig } from '../config/schema.js';
 import type { Complexity, Effort, ModelSelection } from './model-router.js';
+import { resolveRoute } from './model-router.js';
+import { defaultEscalation } from './defaults.js';
 
-const escalation: Record<Complexity, readonly { tier: string; effort: Effort }[]> = {
-  'very-low': [{ tier: 'luna', effort: 'medium' }, { tier: 'luna', effort: 'high' }, { tier: 'terra', effort: 'high' }, { tier: 'sol', effort: 'high' }],
-  low: [{ tier: 'luna', effort: 'high' }, { tier: 'terra', effort: 'high' }, { tier: 'sol', effort: 'high' }],
-  medium: [{ tier: 'terra', effort: 'medium' }, { tier: 'terra', effort: 'high' }, { tier: 'sol', effort: 'high' }],
-  high: [{ tier: 'terra', effort: 'high' }, { tier: 'sol', effort: 'high' }, { tier: 'sol', effort: 'max' }],
-  'very-high': [{ tier: 'sol', effort: 'medium' }, { tier: 'sol', effort: 'high' }, { tier: 'sol', effort: 'max' }],
-  critical: [{ tier: 'sol', effort: 'high' }, { tier: 'sol', effort: 'max' }],
-};
+export { defaultEscalation } from './defaults.js';
 
-/** Every model tier an implementation route can select. */
-export const routedModelTiers: readonly string[] = [...new Set(Object.values(escalation).flatMap((routes) => routes.map((route) => route.tier)))];
+/** Escalation ladder in force for one complexity: a configured ladder replaces the built-in one wholesale. */
+export function escalationLadder(config: OrchestratorConfig, complexity: Complexity): readonly { tier: string; effort: Effort }[] {
+  return config.models.escalation[complexity] ?? defaultEscalation[complexity];
+}
 
 export function escalationStep(config: OrchestratorConfig, complexity: Complexity, attempt: number): ModelSelection | undefined {
   if (!Number.isInteger(attempt) || attempt < 1 || attempt > config.limits.maxImplementationAttempts) {
     return undefined;
   }
-  const route = escalation[complexity][attempt - 1];
+  const route = escalationLadder(config, complexity)[attempt - 1];
   if (!route) return undefined;
-  const configuredTier = config.models.tiers[route.tier];
-  if (!configuredTier) throw new Error(`No model configured for tier: ${route.tier}`);
-  return { tier: route.tier, model: configuredTier.model, effort: route.effort };
+  return resolveRoute(config, route);
 }

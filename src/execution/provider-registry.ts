@@ -1,0 +1,74 @@
+import type { OrchestratorConfig } from '../config/schema.js';
+import { effectiveProviders, type ResolvedProvider } from '../config/providers.js';
+import type { ModelSelection } from '../types/model.js';
+import { CodexCliAdapter } from './adapters/codex-cli.js';
+import { adapterCapabilitiesOf, effectiveConfinement, type CommandConfinement } from './adapters/capabilities.js';
+import type { AgentRunner } from './agent-runner.js';
+
+/** Variables every runner process needs, whatever provider it is. Credentials arrive only through provider environment. */
+export const baseRunnerEnvironment = ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'XDG_CONFIG_HOME'] as const;
+
+export interface ProviderRuntimeOptions {
+  /** Private directory for per-run schema and result files, outside every agent-writable directory. */
+  scratchRoot: string;
+  sourceEnvironment: NodeJS.ProcessEnv;
+  maxResultBytes: number;
+  maxEventBytes: number;
+  knownSecrets: readonly string[];
+  clock?: () => Date;
+}
+
+export interface ProviderHandle {
+  alias: string;
+  kind: string;
+  executable: string;
+  confinement: CommandConfinement;
+  runner: AgentRunner;
+}
+
+/** One provider ready to run: its adapter, plus the confinement that adapter actually provides. */
+export interface ProviderRegistry {
+  handles: readonly ProviderHandle[];
+  /** The adapter that runs one routed selection, or `undefined` when no provider serves it. */
+  forSelection(selection: ModelSelection): ProviderHandle | undefined;
+  /** The only provider in force, for evidence when a selection named none. */
+  sole(): ProviderHandle | undefined;
+}
+
+const createAdapter = (kind: string, executable: string, options: ProviderRuntimeOptions, environment: readonly string[]): AgentRunner => {
+  switch (kind) {
+    case 'codex-cli':
+      return new CodexCliAdapter({ ...options, executable, extraEnvironment: environment, baseEnvironment: baseRunnerEnvironment });
+    default:
+      // Unreachable through validated configuration; kept so a new capability entry cannot run unadapted.
+      throw new Error(`No adapter implementation for agent runner kind: ${kind}`);
+  }
+};
+
+/**
+ * Builds the adapters a configuration needs. A provider is built once and shared by every role that routes to it, so
+ * confinement and environment handling cannot differ between roles using the same provider.
+ */
+export function createProviderRegistry(config: OrchestratorConfig, options: ProviderRuntimeOptions): ProviderRegistry {
+  const handles = effectiveProviders(config).map((provider) => toHandle(provider, config, options));
+  const legacy = config.agents?.runner;
+  if (handles.length === 0 && legacy?.executable !== undefined) {
+    // No provider was declared, but agents run: the pre-registry `agents.runner` block is the provider in force.
+    handles.push(toHandle({ alias: legacy.kind, kind: legacy.kind, executable: legacy.executable, environment: legacy.environment, effort: {}, legacy: true }, config, options));
+  }
+  return {
+    handles,
+    forSelection: (selection) => handles.find((handle) => handle.alias === selection.provider) ?? (handles.length === 1 ? handles[0] : undefined),
+    sole: () => (handles.length === 1 ? handles[0] : undefined),
+  };
+}
+
+function toHandle(provider: ResolvedProvider, config: OrchestratorConfig, options: ProviderRuntimeOptions): ProviderHandle {
+  return {
+    alias: provider.alias,
+    kind: provider.kind,
+    executable: provider.executable,
+    confinement: effectiveConfinement(adapterCapabilitiesOf(provider.kind), config.sandbox.kind),
+    runner: createAdapter(provider.kind, provider.executable, options, provider.environment),
+  };
+}

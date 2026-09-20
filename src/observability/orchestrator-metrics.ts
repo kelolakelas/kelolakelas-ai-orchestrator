@@ -50,8 +50,8 @@ export class OrchestratorMetrics implements SchedulerObserver {
   private readonly quarantined = this.registry.gauge('orchestrator_intake_quarantined', 'Linear issues quarantined by intake.');
   private readonly awaitingMerge = this.registry.gauge('orchestrator_pull_requests_awaiting_merge', 'Open orchestrator pull requests not yet merged.');
   private readonly attempts = this.registry.counter('orchestrator_attempts_total', 'Recorded stage attempts by stage and failure category (succeeded when none).', ['stage', 'category']);
-  private readonly tokens = this.registry.counter('orchestrator_model_tokens_total', 'Runner tokens by model and kind.', ['model', 'kind']);
-  private readonly cost = this.registry.counter('orchestrator_model_cost_usd_total', 'Estimated runner spend from metrics.modelPricing.', ['model']);
+  private readonly tokens = this.registry.counter('orchestrator_model_tokens_total', 'Runner tokens by provider, model, and kind.', ['model', 'provider', 'kind']);
+  private readonly cost = this.registry.counter('orchestrator_model_cost_usd_total', 'Estimated runner spend from metrics.modelPricing, by provider.', ['model', 'provider']);
   private readonly inFlight = this.registry.gauge('orchestrator_in_flight_tasks', 'Tasks this worker is running, by lane.', ['lane']);
   private readonly inFlightAge = this.registry.gauge('orchestrator_in_flight_stage_age_seconds_max', 'Longest-running in-flight stage on this worker.');
   private readonly killSwitch = this.registry.gauge('orchestrator_kill_switch_engaged', 'Whether the kill switch is engaged (1) as last read by this worker.');
@@ -117,12 +117,13 @@ export class OrchestratorMetrics implements SchedulerObserver {
     this.awaitingMerge.set({}, snapshot.workUnitsAwaitingMerge);
     for (const row of snapshot.attempts) this.attempts.set({ stage: row.stage, category: row.category }, row.attempts);
     for (const row of snapshot.tokens) {
-      this.tokens.set({ model: row.model, kind: 'input' }, row.inputTokens);
-      this.tokens.set({ model: row.model, kind: 'cached_input' }, row.cachedInputTokens);
-      this.tokens.set({ model: row.model, kind: 'output' }, row.outputTokens);
-      this.tokens.set({ model: row.model, kind: 'reasoning_output' }, row.reasoningOutputTokens);
+      const labels = { model: row.model, provider: row.provider };
+      this.tokens.set({ ...labels, kind: 'input' }, row.inputTokens);
+      this.tokens.set({ ...labels, kind: 'cached_input' }, row.cachedInputTokens);
+      this.tokens.set({ ...labels, kind: 'output' }, row.outputTokens);
+      this.tokens.set({ ...labels, kind: 'reasoning_output' }, row.reasoningOutputTokens);
       const price = pricing[row.model];
-      if (price !== undefined) this.cost.set({ model: row.model }, estimateCostUsd(row, price));
+      if (price !== undefined) this.cost.set(labels, estimateCostUsd(row, price));
     }
   }
 

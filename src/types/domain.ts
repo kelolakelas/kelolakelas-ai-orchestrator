@@ -19,7 +19,18 @@ export const taskStates = [
 
 export type TaskState = (typeof taskStates)[number];
 
-export type PauseReason = 'OPERATING_HOURS_ENDED' | 'CODEX_USAGE_LIMIT' | 'RATE_LIMIT' | 'REMOTE_UNAVAILABLE';
+/**
+ * Why a task is parked. `USAGE_LIMIT` is provider-neutral; `CODEX_USAGE_LIMIT` is the pre-registry value and is still
+ * read, so rows written before the provider registry existed keep pausing and resuming correctly.
+ */
+export type PauseReason = 'OPERATING_HOURS_ENDED' | 'USAGE_LIMIT' | 'CODEX_USAGE_LIMIT' | 'RATE_LIMIT' | 'REMOTE_UNAVAILABLE';
+
+/** Pause reasons that hold the execution lane until `resumeAfter`, whatever provider reported them. */
+export const providerLimitPauses: readonly PauseReason[] = ['USAGE_LIMIT', 'CODEX_USAGE_LIMIT', 'RATE_LIMIT'];
+
+export function isProviderLimitPause(reason: PauseReason | null | undefined): boolean {
+  return reason !== null && reason !== undefined && providerLimitPauses.includes(reason);
+}
 
 export type OperationType =
   | 'TASK_DISCOVERY'
