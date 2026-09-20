@@ -6,7 +6,7 @@ import type { LinearProvider } from '../providers/linear.js';
 import type { OperatorRepository, OrchestratorControls } from '../repositories/operator.repository.js';
 import { LeaseOwnershipError, type ClaimableWork, type PersistedTask, type TaskRepository } from '../repositories/task.repository.js';
 import { operationGate, shouldInterruptRunningStage, stageGate } from '../scheduling/stage-gate.js';
-import { claimLaneOf, transitionMap, type ClaimLane, type TaskState } from '../types/domain.js';
+import { claimLaneOf, isProviderLimitPause, transitionMap, type ClaimLane, type TaskState } from '../types/domain.js';
 import { canTransition } from './state-machine.js';
 import type { StageAbortReason, StageHandlers } from './stage-handler.js';
 
@@ -553,8 +553,8 @@ export class Scheduler {
               releaseLease: true,
             });
             this.options.log('task_paused_limit', { ...fields(task), resumeAfter: task.resumeAfter });
-            // Runner limits are account-wide: starting or resuming other tasks now would only hit the same limit.
-            if ((outcome.pauseReason === 'CODEX_USAGE_LIMIT' || outcome.pauseReason === 'RATE_LIMIT') && task.resumeAfter !== null) {
+            // Provider limits are account-wide: starting or resuming other tasks now would only hit the same limit.
+            if (isProviderLimitPause(outcome.pauseReason) && task.resumeAfter !== null) {
               this.holdLane('execution', task.resumeAfter, `runner ${outcome.pauseReason}`);
             }
             return;

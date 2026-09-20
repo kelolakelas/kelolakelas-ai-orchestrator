@@ -8,6 +8,8 @@ import * as schema from '../src/db/schema.js';
 import { fixResultVersion, implementationResultVersion, reviewResultVersion, type AnalysisResult } from '../src/execution/agent-results.js';
 import type { AgentRole, AgentRunner, AgentRunRequest, AgentRunResult } from '../src/execution/agent-runner.js';
 import { DocumentationLoader } from '../src/execution/documentation.js';
+import { DispatchingAgentRunner } from '../src/execution/dispatching-runner.js';
+import { createProviderRegistry } from '../src/execution/provider-registry.js';
 import { QualityGateRunner } from '../src/execution/quality-gates.js';
 import { createExecutionHandlers } from '../src/execution/stages/index.js';
 import { reviewedLocalBranchReason } from '../src/execution/stages/review-stage.js';
@@ -24,6 +26,7 @@ import { WorkspaceManager } from '../src/workspaces/workspace-manager.js';
 import { analysisResult } from './support/agent-fixtures.js';
 import { insideHours } from './support/config.js';
 import { resetDatabase } from './support/database.js';
+import { createFakeCodex } from './support/fake-codex.js';
 import { createGitFixture, git, type GitFixture } from './support/git-fixture.js';
 
 const databaseUrl = process.env.MIGRATION_TEST_DATABASE_URL;
@@ -402,7 +405,7 @@ describeIntegration('supervised agent execution with PostgreSQL and Git', { time
     const task = await createTask('limits', '8', ['web']);
 
     await tick(scheduler);
-    expect(await tasks.getTask(task.id)).toMatchObject({ state: 'PAUSED_LIMIT', resumeState: 'IMPLEMENTING', pauseReason: 'CODEX_USAGE_LIMIT', implementationAttempts: 0, leaseOwner: null });
+    expect(await tasks.getTask(task.id)).toMatchObject({ state: 'PAUSED_LIMIT', resumeState: 'IMPLEMENTING', pauseReason: 'USAGE_LIMIT', implementationAttempts: 0, leaseOwner: null });
 
     now = new Date(insideHours.getTime() + 5 * 60_000);
     await tick(scheduler);
@@ -459,5 +462,90 @@ describeIntegration('supervised agent execution with PostgreSQL and Git', { time
     expect(await tasks.getTask(task.id)).toMatchObject({ state: 'BLOCKED', requiresManualIntervention: true, lastError: expect.stringContaining('check command feature could not start') });
     expect((await attempts(task.id)).slice(-1)).toEqual(['TESTING#1:quality-infrastructure']);
     expect(runner.roles()).toEqual(['analyzer', 'implementer']);
+  });
+
+  it('runs a full analyzer, implementer, fixer, reviewer cycle through the provider registry alone', async () => {
+    // Two provider executables, so the provider that served each role is proved by which process recorded the run.
+    const primary = createFakeCodex();
+    const secondary = createFakeCodex();
+    try {
+      // One queued scenario per run the primary provider is expected to serve, in stage order.
+      primary.queue([
+        { mode: 'result', result: plan(['web']) },
+        { mode: 'result', result: change(implementationResultVersion, ['web']), writeFiles: { 'web/feature.txt': 'draft\n' } },
+        { mode: 'result', result: change(fixResultVersion, ['web'], 'Fixed it'), writeFiles: { 'web/feature.txt': 'ready\n' } },
+      ]);
+      secondary.queue([{ mode: 'result', result: { schemaVersion: reviewResultVersion, verdict: 'approve', summary: 'Meets the criteria', findings: [] } }]);
+
+      const base = config();
+      // The legacy runner block keeps only what the registry does not supply: this is the end state of a migrated
+      // configuration, where no transport path survives outside `models.providers`.
+      const orchestratorConfig = validateConfig({
+        ...base,
+        agents: { runner: { rateLimitRetryMinutes: 5 }, commitAuthor: { name: 'KelolaKelas Orchestrator', email: 'orchestrator@example.test' } },
+        models: {
+          ...base.models,
+          providers: {
+            primary: { kind: 'codex-cli', executable: primary.executable },
+            secondary: { kind: 'codex-cli', executable: secondary.executable },
+          },
+          tiers: { luna: { model: 'model-luna', provider: 'primary' }, terra: { model: 'model-terra', provider: 'primary' }, sol: { model: 'model-sol', provider: 'secondary' } },
+          // `max` has no Codex equivalent, so the route proves the canonical effort scale reaches the adapter's map.
+          escalation: { low: [{ tier: 'luna', effort: 'max' }] },
+          roles: { fixer: { tier: 'luna', effort: 'max' } },
+        },
+      });
+      const providers = createProviderRegistry(orchestratorConfig, {
+        scratchRoot: join(fixture.base, 'runner'),
+        sourceEnvironment: process.env,
+        maxResultBytes: 256 * 1024,
+        maxEventBytes: 4 * 1024 * 1024,
+        knownSecrets: [],
+      });
+      // No adapter is ever reachable without a declared confinement, so configuration cannot buy an unconfined run.
+      expect(providers.handles.map(({ alias, kind, confinement }) => `${alias}:${kind}:${confinement}`))
+        .toEqual(['primary:codex-cli:provider-sandbox', 'secondary:codex-cli:provider-sandbox']);
+
+      const scheduler = await worker(new DispatchingAgentRunner(providers), orchestratorConfig);
+      const task = await createTask('providers', '11', ['web']);
+
+      await tick(scheduler);
+      await tick(scheduler);
+
+      expect(await tasks.getTask(task.id)).toMatchObject({ state: 'BLOCKED', requiresManualIntervention: false });
+      expect(await transitions(task.id)).toEqual([
+        'QUEUED->ANALYZING', 'ANALYZING->READY', 'READY->IMPLEMENTING', 'IMPLEMENTING->TESTING', 'TESTING->FIXING', 'FIXING->TESTING', 'TESTING->REVIEWING', 'REVIEWING->BLOCKED',
+      ]);
+
+      // Every stage ran through the registry: three runs on the primary provider, and the reviewer on the secondary one.
+      const runs = primary.invocations();
+      expect(runs).toHaveLength(3);
+      expect(secondary.invocations()).toHaveLength(1);
+      expect(primary.remaining()).toBe(0);
+      expect(secondary.remaining()).toBe(0);
+
+      // Which provider, model, effort, and access each role received is readable from the real argv it was spawned with.
+      const option = (args: string[], name: string) => args[args.indexOf(name) + 1];
+      expect(runs.map(({ args }) => option(args, '--model'))).toEqual(['model-terra', 'model-luna', 'model-luna']);
+      expect(runs.map(({ args }) => option(args, '--sandbox'))).toEqual(['read-only', 'workspace-write', 'workspace-write']);
+      // The canonical `max` effort reaches Codex as `xhigh`; the analyzer's `high` passes through unchanged.
+      expect(runs.map(({ args }) => args.find((argument) => argument.startsWith('model_reasoning_effort'))))
+        .toEqual(['model_reasoning_effort="high"', 'model_reasoning_effort="xhigh"', 'model_reasoning_effort="xhigh"']);
+      expect(option(secondary.invocations()[0]!.args, '--model')).toBe('model-sol');
+
+      // Every agent attempt records the provider that served it, so evidence can reproduce the run from configuration.
+      const attempts = await tasks.listAttempts(task.id);
+      const model = (attempt: (typeof attempts)[number]) => (attempt.input as { model?: { provider: string } }).model?.provider ?? '(none)';
+      expect(attempts.map((attempt) => `${attempt.stage}#${attempt.attempt}:${model(attempt)}`)).toEqual([
+        'ANALYZING#1:primary', 'READY#1:(none)', 'IMPLEMENTING#1:primary', 'TESTING#1:(none)',
+        'FIXING#1:primary', 'TESTING#2:(none)', 'REVIEWING#1:secondary',
+      ]);
+      // The work only counted because a different provider executed it: the fix's content is on the branch.
+      const { path } = await workspace(task.id, 'web');
+      expect(readFileSync(join(path, 'feature.txt'), 'utf8')).toBe('ready\n');
+    } finally {
+      primary.cleanup();
+      secondary.cleanup();
+    }
   });
 });

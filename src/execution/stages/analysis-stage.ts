@@ -3,7 +3,7 @@ import { analysisProblems, analysisResultSchema } from '../agent-results.js';
 import { buildAnalysisPrompt, promptDigest, promptTemplateVersion } from '../prompts.js';
 import {
   analysisCheckpointSchema, checkpointKeys, completeAttempt, contractDigest, failureCategoryOf, loadTaskWorkspaces, manualIntervention,
-  modelInput, pauseOrInterruption, readCheckpoint, startAttempt, workspaceSnapshots, type ExecutionDependencies,
+  modelInput, pauseOrInterruption, readCheckpoint, roleModel, startAttempt, workspaceSnapshots, type ExecutionDependencies,
 } from './stage-support.js';
 
 /**
@@ -24,8 +24,7 @@ export class AnalysisStage implements StageHandler {
 
     const documentation = await deps.documentation.load(loaded.contract.repositories);
     const prompt = buildAnalysisPrompt({ contract: loaded.contract, workspaces: loaded.prompt, documentation });
-    const tier = deps.config.models.analyzer.tier;
-    const model = { tier, model: deps.config.models.tiers[tier]?.model ?? '', effort: deps.config.models.analyzer.effort };
+    const model = roleModel(deps.config, 'analyzer');
     const scope = await startAttempt(deps, task, {
       promptTemplateVersion, ...promptDigest(prompt), model: modelInput(model), heads: loaded.heads, contractDigest: digest,
       documentation: documentation.map(({ path, sha256, truncated }) => ({ path, sha256, truncated })),

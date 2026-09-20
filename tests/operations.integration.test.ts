@@ -269,7 +269,7 @@ describeIntegration('production operations with PostgreSQL', () => {
         run: async () => {
           if (first) {
             first = false;
-            return { kind: 'pause-limit', pauseReason: 'CODEX_USAGE_LIMIT', resumeAfter };
+            return { kind: 'pause-limit', pauseReason: 'USAGE_LIMIT', resumeAfter };
           }
           return { kind: 'advance', to: 'READY' };
         },
@@ -282,7 +282,7 @@ describeIntegration('production operations with PostgreSQL', () => {
     await instance.runOnce();
     await instance.drain();
     expect(await tasks.getTask(other)).toMatchObject({ state: 'QUEUED' });
-    expect(instance.status().laneHolds.execution).toMatchObject({ until: resumeAfter, reason: 'runner CODEX_USAGE_LIMIT' });
+    expect(instance.status().laneHolds.execution).toMatchObject({ until: resumeAfter, reason: 'runner USAGE_LIMIT' });
 
     now = new Date(resumeAfter.getTime() + 1_000);
     await instance.runOnce();
@@ -303,7 +303,7 @@ describeIntegration('production operations with PostgreSQL', () => {
     await pool.query(`INSERT INTO state_transitions (task_id, from_state, to_state, created_at) VALUES ($1, 'PR_CREATED', 'WAITING_CI', now() - interval '2 hours')`, [waiting]);
     await pool.query(`UPDATE tasks SET lease_owner = 'dead-worker', lease_expires_at = now() - interval '5 minutes' WHERE id = $1`, [stale]);
     await pool.query(`INSERT INTO task_attempts (task_id, stage, attempt, failure_category, input, usage, completed_at)
-      VALUES ($1, 'IMPLEMENTING', 1, NULL, '{"model":{"tier":"terra","model":"model-x"}}', '{"inputTokens":1000,"cachedInputTokens":400,"outputTokens":250,"reasoningOutputTokens":100}', now())`, [stale]);
+      VALUES ($1, 'IMPLEMENTING', 1, NULL, '{"model":{"provider":"primary","tier":"terra","model":"model-x"}}', '{"inputTokens":1000,"cachedInputTokens":400,"outputTokens":250,"reasoningOutputTokens":100}', now())`, [stale]);
 
     const metrics = new OrchestratorMetrics();
     metrics.applySnapshot(await new MetricsRepository(drizzle(pool, { schema })).snapshot(), {});
@@ -313,7 +313,7 @@ describeIntegration('production operations with PostgreSQL', () => {
     expect(Number(/orchestrator_task_state_age_seconds_max\{state="WAITING_CI"\} (\d+)/.exec(text)?.[1])).toBeGreaterThanOrEqual(7_190);
     expect(text).toContain('orchestrator_leases_stale 1');
     expect(text).toContain('orchestrator_attempts_total{stage="IMPLEMENTING",category="succeeded"} 1');
-    expect(text).toContain('orchestrator_model_tokens_total{model="model-x",kind="input"} 1000');
+    expect(text).toContain('orchestrator_model_tokens_total{model="model-x",provider="primary",kind="input"} 1000');
     expect(text).not.toContain(waiting);
     expect(text).not.toContain('KEL-');
   });

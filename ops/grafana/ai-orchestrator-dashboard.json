@@ -813,8 +813,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (model, kind) (increase(orchestrator_model_tokens_total[1h]))",
-          "legendFormat": "{{model}} {{kind}}",
+          "expr": "sum by (provider, model, kind) (increase(orchestrator_model_tokens_total[1h]))",
+          "legendFormat": "{{provider}} {{model}} {{kind}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -852,8 +852,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (model) (increase(orchestrator_model_cost_usd_total[24h]))",
-          "legendFormat": "{{model}}",
+          "expr": "sum by (provider, model) (increase(orchestrator_model_cost_usd_total[24h]))",
+          "legendFormat": "{{provider}} {{model}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

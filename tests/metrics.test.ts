@@ -50,13 +50,13 @@ describe('orchestrator metrics', () => {
       manualIntervention: 3,
       quarantined: 0,
       attempts: [{ stage: 'TESTING', category: 'quality-failed', attempts: 4 }],
-      tokens: [{ model: 'gpt-test', inputTokens: 2_000_000, cachedInputTokens: 1_000_000, outputTokens: 500_000, reasoningOutputTokens: 200_000 }],
+      tokens: [{ model: 'balanced-model', provider: 'primary', inputTokens: 2_000_000, cachedInputTokens: 1_000_000, outputTokens: 500_000, reasoningOutputTokens: 200_000 }],
       workUnitsAwaitingMerge: 2,
-    }, { 'gpt-test': { inputPerMillionTokens: 2, cachedInputPerMillionTokens: 0.5, outputPerMillionTokens: 8 } });
+    }, { 'balanced-model': { inputPerMillionTokens: 2, cachedInputPerMillionTokens: 0.5, outputPerMillionTokens: 8 } });
     metrics.applyScheduler({
       inFlight: [{ stage: 'IMPLEMENTING', since: new Date('2026-09-17T00:00:00Z') }, { stage: 'WAITING_CI', since: new Date('2026-09-17T00:09:00Z') }],
       controls: { pauseNewWork: false, killSwitch: true },
-      laneHolds: { execution: { until: new Date('2026-09-17T01:00:00Z'), reason: 'runner CODEX_USAGE_LIMIT' } },
+      laneHolds: { execution: { until: new Date('2026-09-17T01:00:00Z'), reason: 'runner USAGE_LIMIT' } },
     });
     metrics.stageFinished('TESTING', 'advance', 90_000);
     metrics.stateExited('WAITING_CI', 1_200);
@@ -67,8 +67,8 @@ describe('orchestrator metrics', () => {
     expect(text).toContain('orchestrator_task_state_age_seconds_max{state="WAITING_CI"} 5400');
     expect(text).toContain('orchestrator_leases_stale 1');
     expect(text).toContain('orchestrator_attempts_total{stage="TESTING",category="quality-failed"} 4');
-    expect(text).toContain('orchestrator_model_tokens_total{model="gpt-test",kind="cached_input"} 1000000');
-    expect(text).toContain('orchestrator_model_cost_usd_total{model="gpt-test"} 6.5');
+    expect(text).toContain('orchestrator_model_tokens_total{model="balanced-model",provider="primary",kind="cached_input"} 1000000');
+    expect(text).toContain('orchestrator_model_cost_usd_total{model="balanced-model",provider="primary"} 6.5');
     expect(text).toContain('orchestrator_in_flight_tasks{lane="execution"} 1');
     expect(text).toContain('orchestrator_in_flight_stage_age_seconds_max 600');
     expect(text).toContain('orchestrator_kill_switch_engaged 1');

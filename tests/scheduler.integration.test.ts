@@ -224,7 +224,7 @@ describeIntegration('scheduler with PostgreSQL', () => {
         run: async () => {
           if (limited) return { kind: 'advance', to: 'READY' };
           limited = true;
-          return { kind: 'pause-limit', pauseReason: 'CODEX_USAGE_LIMIT', resumeAfter: new Date(now.getTime() + 10 * 60_000) };
+          return { kind: 'pause-limit', pauseReason: 'USAGE_LIMIT', resumeAfter: new Date(now.getTime() + 10 * 60_000) };
         },
       },
     };
@@ -232,7 +232,7 @@ describeIntegration('scheduler with PostgreSQL', () => {
 
     await instance.runOnce();
     await instance.drain();
-    expect(await tasks.getTask(taskId!)).toMatchObject({ state: 'PAUSED_LIMIT', resumeState: 'ANALYZING', pauseReason: 'CODEX_USAGE_LIMIT' });
+    expect(await tasks.getTask(taskId!)).toMatchObject({ state: 'PAUSED_LIMIT', resumeState: 'ANALYZING', pauseReason: 'USAGE_LIMIT' });
 
     now = new Date(insideHours.getTime() + 5 * 60_000);
     await instance.runOnce();

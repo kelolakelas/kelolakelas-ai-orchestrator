@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { analysisResultSchema } from '../src/execution/agent-results.js';
-import { classifyRunnerFailure, CodexCliRunner, parseRetryAfter, type AgentRunRequest } from '../src/execution/agent-runner.js';
+import { classifyRunnerFailure, parseRetryAfter, type AgentRunRequest } from '../src/execution/agent-runner.js';
+import { CodexCliAdapter } from '../src/execution/adapters/codex-cli.js';
+import { baseRunnerEnvironment } from '../src/execution/provider-registry.js';
 import { analysisResult } from './support/agent-fixtures.js';
 import { createFakeCodex, type FakeCodex } from './support/fake-codex.js';
 
@@ -40,8 +42,8 @@ describe('Codex CLI runner', () => {
     rmSync(taskDirectory, { recursive: true, force: true });
   });
 
-  function runner(overrides: Partial<ConstructorParameters<typeof CodexCliRunner>[0]> = {}) {
-    return new CodexCliRunner({
+  function runner(overrides: Partial<ConstructorParameters<typeof CodexCliAdapter>[0]> = {}) {
+    return new CodexCliAdapter({
       executable: fake.executable,
       scratchRoot: fake.scratch,
       sourceEnvironment: { PATH: process.env.PATH, HOME: '/home/runner', OPENAI_API_KEY: 'sk-test-openai-credential-value-000000', LINEAR_API_KEY: 'lin-secret', DATABASE_URL: 'postgres://u:p@h/d' },
@@ -49,6 +51,7 @@ describe('Codex CLI runner', () => {
       maxResultBytes: 64 * 1024,
       maxEventBytes: 1024 * 1024,
       knownSecrets: ['sk-test-openai-credential-value-000000'],
+      baseEnvironment: baseRunnerEnvironment,
       clock: () => now,
       ...overrides,
     });
@@ -57,7 +60,7 @@ describe('Codex CLI runner', () => {
   function request(overrides: Partial<AgentRunRequest<unknown>> = {}): AgentRunRequest<ReturnType<typeof analysisResultSchema.parse>> {
     return {
       role: 'analyzer',
-      model: { tier: 'terra', model: 'model-terra', effort: 'max' },
+      model: { provider: 'codex', tier: 'terra', model: 'model-terra', effort: 'max' },
       prompt: 'PROMPT BODY',
       taskDirectory,
       access: 'read-only',

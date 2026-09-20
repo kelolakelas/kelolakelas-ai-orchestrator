@@ -89,7 +89,7 @@ describe('quality gate runner', () => {
 });
 
 describe('agent execution configuration', () => {
-  const agents = { runner: { executable: '/usr/local/bin/codex', environment: ['CODEX_HOME'] }, commitAuthor: { name: 'Orchestrator', email: 'orchestrator@example.test' } };
+  const agents = { runner: { executable: '/usr/local/bin/agent-runner', environment: ['AGENT_HOME'] }, commitAuthor: { name: 'Orchestrator', email: 'orchestrator@example.test' } };
   const repositories = { web: { path: '/srv/web', github: 'kelolakelas/kelolakelas-web', quality: { checks: [{ name: 'test', command: ['npm', 'test'] }] } } };
 
   function configWith(overrides: Record<string, unknown>) {

@@ -1,4 +1,5 @@
 import pino, { type LoggerOptions } from 'pino';
+import { allCredentialEnvironment } from '../security/credentials.js';
 
 export const loggerOptions: LoggerOptions = {
   redact: {
@@ -12,10 +13,9 @@ export const loggerOptions: LoggerOptions = {
       'headers.authorization',
       'headers.cookie',
       'headers.x-api-key',
-      'environment.DATABASE_URL',
-      'environment.LINEAR_API_KEY',
-      'environment.OPENAI_API_KEY',
-      'environment.ORCHESTRATOR_OPERATOR_TOKEN',
+      // Every credential name the orchestrator knows, so a newly configured provider is redacted without a code change.
+      ...allCredentialEnvironment.map((name) => `environment.${name}`),
+      ...allCredentialEnvironment.map((name) => `env.${name}`),
     ],
     censor: '[REDACTED]',
   },

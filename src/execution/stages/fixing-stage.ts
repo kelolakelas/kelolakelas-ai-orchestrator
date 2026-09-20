@@ -1,6 +1,6 @@
 import type { StageContext, StageHandler, StageOutcome } from '../../orchestrator/stage-handler.js';
 import { escalationStep } from '../../routing/escalation-policy.js';
-import type { Effort, ModelSelection } from '../../routing/model-router.js';
+import { resolveRoute, type Effort, type ModelSelection } from '../../routing/model-router.js';
 import { fixResultSchema } from '../agent-results.js';
 import { buildFixPrompt, promptDigest, promptTemplateVersion } from '../prompts.js';
 import { inspectAndCommit } from './change-application.js';
@@ -93,8 +93,8 @@ export class FixingStage implements StageHandler {
     const { deps } = this;
     const efforts: readonly string[] = ['low', 'medium', 'high', 'max'] satisfies Effort[];
     if (task.selectedModelTier !== null && task.reasoningEffort !== null && efforts.includes(task.reasoningEffort) && deps.config.models.tiers[task.selectedModelTier] !== undefined) {
-      // The model identifier is re-read from configuration, never trusted from the database row.
-      return { tier: task.selectedModelTier, model: deps.config.models.tiers[task.selectedModelTier]?.model ?? '', effort: task.reasoningEffort as Effort };
+      // Tier, model, and provider are re-read from configuration, never trusted from the database row.
+      return resolveRoute(deps.config, { tier: task.selectedModelTier, effort: task.reasoningEffort as Effort });
     }
     return escalationStep(deps.config, complexity, Math.max(1, implementationAttempts));
   }
